@@ -49,6 +49,11 @@ class MockRelayService : Service() {
     @Volatile private var out: BufferedWriter? = null
 
     private var consecutiveFail = 0
+    /** 断流起始时刻, 用于回差判定 */
+    private var silentSince = 0L
+    /** 重新接管所需的连续帧计数 */
+    private var reacquireCount = 0
+    private var reacquireLastMs = 0L
 
     /** 已发出但未收到回包的 ping 时刻，用于计算真实 RTT */
     private val pendingPings = java.util.concurrent.ConcurrentHashMap<Long, Boolean>()
@@ -83,6 +88,13 @@ class MockRelayService : Service() {
             srcLabel = st.source.label
             srcSats = "${st.satsUsed}/${st.satsTotal}"
             srcAgeSec = if (st.ageMs < 0) -1 else st.ageMs / 1000
+        }
+        // 只要正在持续注入手机坐标, 使用者看到的就是手机 GPS。
+        // 比只看 provider 的 mock 标志可靠: 注入期间系统层面还会冒出别的定位
+        // (基站定位、提供器重建瞬间的真实 GPS), 光看标志会反复跳。
+        sourceMonitor.injectingFresh = {
+            injector.isReady && lastPacketAt > 0 &&
+                System.currentTimeMillis() - lastPacketAt < 5000
         }
         sourceMonitor.start()
         running = true
@@ -222,11 +234,27 @@ class MockRelayService : Service() {
         if (pkt.ts > 0 && pkt.ts <= lastInjectedTs) return
         if (pkt.ts > 0) lastInjectedTs = pkt.ts
 
-        // 断流期间已交还真实 GPS，手机数据回来后重新接管
+        // 断流期间已交还真实 GPS，手机数据回来后重新接管。
+        // 收回也要回差: 只收到一两帧就立刻收回, 手机稍后又停更,
+        // 就变成「归还 → 收回 → 归还」的来回抽搐。要求连续稳定若干帧。
         if (releasedForSilence) {
-            releasedForSilence = false
-            Log.i(TAG, "手机数据恢复，重新接管系统定位")
-            updateNoti("手机数据恢复 · 重新接管定位")
+            val gap = now - reacquireLastMs
+            if (reacquireLastMs == 0L || gap > REACQUIRE_GAP_MS) {
+                reacquireCount = 0
+            }
+            reacquireLastMs = now
+            reacquireCount++
+
+            if (reacquireCount >= REACQUIRE_FRAMES) {
+                releasedForSilence = false
+                reacquireCount = 0
+                reacquireLastMs = 0L
+                Log.i(TAG, "手机数据连续恢复，重新接管系统定位")
+                updateNoti("手机数据恢复 · 重新接管定位")
+            }
+        } else {
+            reacquireCount = 0
+            reacquireLastMs = 0L
         }
 
         injector.inject(pkt)
@@ -261,22 +289,32 @@ class MockRelayService : Service() {
      */
     private fun silenceWatchdog() {
         while (running) {
-            sleepQuiet(2000)
+            sleepQuiet(1000)
             if (!running) break
+            val now = System.currentTimeMillis()
             val ref = if (lastPacketAt > 0) lastPacketAt else serviceStartedAt
-            val silentMs = System.currentTimeMillis() - ref
+            val silentMs = now - ref
 
             // 省电模式下手机降到 0.1Hz（10s 一帧），阈值必须放宽，
-            // 否则两帧之间就会被误判成断流 —— 归还真 GPS 后马上又收回，
-            // 表现为导航画面反复抽搐。正常 1Hz 仍按 15s 判。
+            // 否则两帧之间就会被误判成断流。正常 5Hz 按 15s 判。
             val threshold = if (ecoSent) SILENCE_RELEASE_ECO_MS else SILENCE_RELEASE_MS
 
             if (silentMs > threshold && injector.isReady && !releasedForSilence) {
+                // 回差: 必须「持续」断流才归还。
+                // 手机切后台/息屏时 GPS 常短暂停更几秒, 一超阈值就交还、
+                // 恢复后又立刻收回, 界面就会在「手机 GPS / 盒子自带 GPS」之间
+                // 反复跳, 导航画面也跟着抽搯。
+                if (silentSince == 0L) silentSince = now
+                if (now - silentSince < RELEASE_HOLD_MS) continue
+
                 releasedForSilence = true
+                silentSince = 0L
                 runCatching { injector.release() }
                 state = State.DISCONNECTED
                 updateNoti("手机 ${silentMs / 1000}s 无数据 · 已交还真实 GPS")
                 Log.w(TAG, "断流 ${silentMs}ms(阈值${threshold}ms)，已释放模拟提供器让真实 GPS 接管")
+            } else if (silentMs <= threshold) {
+                silentSince = 0L
             }
         }
     }
@@ -488,6 +526,12 @@ class MockRelayService : Service() {
         private const val NOTI_ID = 2001
         /** 多少毫秒无数据后交还真实 GPS（正常 1Hz） */
         private const val SILENCE_RELEASE_MS = 15_000L
+        /** 断流需持续多久才真正交还真实 GPS(回差) */
+        private const val RELEASE_HOLD_MS = 4_000L
+        /** 重新接管需要连续多少帧 */
+        private const val REACQUIRE_FRAMES = 3
+        /** 帧间隔超过此值即认为「不连续」, 计数归零 */
+        private const val REACQUIRE_GAP_MS = 3_000L
         /** 省电模式（0.1Hz）下的断流阈值，需大于手机 10s 的推送间隔 */
         private const val SILENCE_RELEASE_ECO_MS = 40_000L
         /** TCP 读超时：超过此时长无数据即认定连接假死，主动断开重连 */
