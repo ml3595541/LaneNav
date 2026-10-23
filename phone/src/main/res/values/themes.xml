@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 深色科技风主题：无 ActionBar，纯黑底，状态栏同色沉浸 -->
+    <style name="Theme.LaneNav" parent="Theme.AppCompat.NoActionBar">
+        <item name="android:windowBackground">@color/lanenav_bg</item>
+        <item name="android:statusBarColor">@color/lanenav_bg</item>
+        <item name="android:navigationBarColor">@color/lanenav_bg</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="colorAccent">@color/lanenav_accent</item>
+    </style>
+</resources>
