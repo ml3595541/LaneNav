@@ -34,6 +34,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var metricSats: TextView
     private lateinit var metricLatency: TextView
     private lateinit var metricFrames: TextView
+    private lateinit var metricHeading: TextView
     private lateinit var warnText: TextView
     private lateinit var dataText: TextView
     private lateinit var ipField: android.widget.EditText
@@ -158,6 +159,7 @@ class MainActivity : AppCompatActivity() {
         val grid = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL }
         metricLatency = metricCell(grid, "延迟")
         metricFrames = metricCell(grid, "累计帧")
+        metricHeading = metricCell(grid, "航向")
         statusCard.addView(grid)
 
         dataText = TextView(ctx).apply {
@@ -341,6 +343,16 @@ class MainActivity : AppCompatActivity() {
         ipLabel.visibility = v
     }
 
+    /** 航向显示：角度 + 来源（传感器/GNSS） */
+    private fun mockHeadingText(): String {
+        val b = MockRelayService.lastBearing
+        return when (MockRelayService.lastBsrc) {
+            "sensor" -> String.format("%.0f° 传感器", b)
+            "gnss" -> String.format("%.0f° GNSS", b)
+            else -> "—"
+        }
+    }
+
     private fun metricCell(container: LinearLayout, label: String): TextView {
         val cell = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -499,6 +511,7 @@ class MainActivity : AppCompatActivity() {
         metricLatency.text = if (MockRelayService.lastLatencyMs > 0)
             "${MockRelayService.lastLatencyMs}ms" else "—"
         metricFrames.text = MockRelayService.rxCount.toString()
+        metricHeading.text = mockHeadingText()
         dataText.text = "坐标 ${MockRelayService.lastFixText}"
 
         // ---- 警告 ----

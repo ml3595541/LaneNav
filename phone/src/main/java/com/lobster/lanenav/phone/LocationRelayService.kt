@@ -45,8 +45,21 @@ class LocationRelayService : Service() {
     /** 传输通道: tcp / ble / both */
     @Volatile private var channel: String = "both"
     private var server: ServerSocket? = null
-    private val clients = CopyOnWriteArrayList<Socket>()
-    private val writers = CopyOnWriteArrayList<BufferedWriter>()
+
+    /**
+     * 一条 TCP 连接（socket + 写入器）绑定为一个对象。
+     *
+     * 原来分成 clients / writers 两个平行列表，断连时只能从 writers 里删，
+     * 对应的 socket 留在 clients 里泄漏 —— 枚举次数越算越多，
+     * 而且再也无法单独关闭那条死连接。
+     */
+    private class Conn(val sock: Socket, var w: BufferedWriter? = null)
+
+    private val conns = CopyOnWriteArrayList<Conn>()
+
+    /** 盒子回传的链路延时（手机界面显示） */
+    @Volatile var lastRttMs: Long = 0
+        private set
 
     /**
      * 发送队列。
@@ -222,21 +235,25 @@ class LocationRelayService : Service() {
         if (fix == LocationPacket.FixType.IMU) acc = maxOf(acc, 50f)
         if (loc.provider == LocationManager.NETWORK_PROVIDER) acc = maxOf(acc, 30f)
 
+        val (bearing, bsrc) = resolveBearing(loc)
+
         val pkt = LocationPacket(
             ts = if (loc.time > 0) loc.time else now,
             lat = loc.latitude,
             lon = loc.longitude,
             alt = if (loc.hasAltitude()) loc.altitude else 0.0,
-            bearing = resolveBearing(loc),
+            bearing = bearing,
             speed = if (loc.hasSpeed()) loc.speed else 0f,
             acc = acc,
             vacc = if (Build.VERSION.SDK_INT >= 26 && loc.hasVerticalAccuracy())
                 loc.verticalAccuracyMeters else acc * 2,
             fix = fix,
             sats = sats,
-            satsTotal = satsTotal
+            satsTotal = satsTotal,
+            bsrc = bsrc
         )
         current = pkt
+        updateHeadingSummary(bearing, bsrc)
         lastFixSummary = String.format(
             "%.6f,%.6f ±%.1fm %s %s", pkt.lat, pkt.lon, pkt.acc, pkt.fix.tag, headingTag()
         )
@@ -248,7 +265,7 @@ class LocationRelayService : Service() {
         val nowNoti = System.currentTimeMillis()
         if (nowNoti - lastNotiMs >= 1000L) {
             lastNotiMs = nowNoti
-            updateNoti(clients.size + bleClientCount)
+            updateNoti(conns.size + bleClientCount)
         }
     }
 
@@ -259,21 +276,22 @@ class LocationRelayService : Service() {
      *  - 车速够快且有 GNSS 航向 → 用 GNSS(方向准确, 不受车身磁场干扰)
      *  - 低速/停车/无 GNSS 航向 → 用手机传感器(陀螺仪+磁力计), 否则车头会卡在正北
      */
-    private fun resolveBearing(loc: Location): Float {
+    /** 航向值 + 来源，供界面和车机端显示 */
+    private fun resolveBearing(loc: Location): Pair<Float, String> {
         val h = heading
         val speed = if (loc.hasSpeed()) loc.speed else 0f
         val gnssOk = loc.hasBearing() && speed >= GNSS_BEARING_MIN_SPEED
 
-        if (gnssOk) return loc.bearing
+        if (gnssOk) return loc.bearing to "gnss"
 
         // 低速: 优先传感器
         if (h != null && h.isValid()) {
             h.setLocation(loc.latitude, loc.longitude, if (loc.hasAltitude()) loc.altitude else 0.0)
-            return h.headingDeg
+            return h.headingDeg to "sensor"
         }
 
         // 传感器不可用但 GNSS 有航向值(即使低速), 也用上
-        return if (loc.hasBearing()) loc.bearing else 0f
+        return if (loc.hasBearing()) loc.bearing to "gnss" else 0f to "none"
     }
 
     /** UI 上显示航向来源, 便于现场判断到底在用哪一路。 */
@@ -283,58 +301,122 @@ class LocationRelayService : Service() {
         else "航向无(传感器未就绪)"
     }
 
+    /** 把当前航向与来源写进静态字段，供 UI 直接读 */
+    private fun updateHeadingSummary(bearing: Float, bsrc: String) {
+        lastHeadingSummary = when (bsrc) {
+            "sensor" -> String.format("%.0f° · 传感器", bearing)
+            "gnss" -> String.format("%.0f° · GNSS", bearing)
+            else -> "无"
+        }
+        lastRtt = lastRttMs
+    }
+
     // ---------------- TCP Server ----------------
 
+    /**
+     * 监听线程。
+     *
+     * 关键教训: 原来整个 accept 循环包在一个 try 里, 循环体内任何一次异常
+     * (比如打电话/切应用时系统拒绝 Binder 通知调用) 都会让线程永久退出。
+     * 但 ServerSocket 仍然在监听, 操作系统的连接队列照样完成 TCP 握手 ——
+     * 盒子能「连上」却永远收不到数据, 界面永远卡在「连接中」,
+     * 只有停止服务重建线程才能恢复。
+     *
+     * 现在: 单个连接的错误完全隔离在 setupClient 内部,
+     * accept 外层再套一层重建循环, 任何情况下都能自愈。
+     */
     private fun startServer() {
         thread(name = "relay-server", isDaemon = true) {
-            try {
-                server = ServerSocket(WireProtocol.DEFAULT_PORT).apply {
-                    reuseAddress = true
-                }
-                Log.i(TAG, "服务端已启动 :${WireProtocol.DEFAULT_PORT}")
-                while (true) {
-                    val sock = server?.accept() ?: break
-                    sock.soTimeout = 0
-                    sock.tcpNoDelay = true
-                    // 开 TCP 保活: 盒子被带离/手机热点掉线时, 死连接能被及时发现
-                    // 并回收, 而不是留着一条看似正常、实则写不出去的管道。
-                    runCatching { sock.keepAlive = true }
-                    clients += sock
-                    clientCount = clients.size
-                    updateNoti(clientCount)
-                    Log.i(TAG, "盒子已接入: ${sock.inetAddress.hostAddress}")
+            while (isRunning) {
+                var ss: ServerSocket? = null
+                try {
+                    ss = ServerSocket().apply {
+                        reuseAddress = true
+                        bind(java.net.InetSocketAddress(WireProtocol.DEFAULT_PORT))
+                    }
+                    server = ss
+                    Log.i(TAG, "服务端已启动 :${WireProtocol.DEFAULT_PORT}")
 
-                    // 每连接一个写线程
-                    thread(name = "relay-writer", isDaemon = true) {
-                        val w = BufferedWriter(OutputStreamWriter(sock.getOutputStream()))
-                        writers += w
-                        // 立刻补一帧, 盒子不用等下一秒
-                        current?.let { runCatching { w.write(it.toJson() + "\n"); w.flush() } }
-                        // 读线程: 收盒子命令
-                        runCatching {
-                            sock.getInputStream().bufferedReader().useLines { lines ->
-                                lines.forEach { line ->
-                                    val pingTs = WireProtocol.parseTs(line, WireProtocol.CMD_PING)
-                                    if (pingTs != null) {
-                                        runCatching {
-                                            w.write(WireProtocol.pong(pingTs) + "\n")
-                                            w.flush()
-                                        }
-                                    } else {
-                                        when (WireProtocol.parseCommand(line)) {
-                                            WireProtocol.CMD_SLEEP -> parked = true
-                                            WireProtocol.CMD_WAKE -> parked = false
-                                        }
-                                    }
-                                }
+                    while (isRunning) {
+                        val sock = try {
+                            ss.accept()
+                        } catch (e: Exception) {
+                            Log.w(TAG, "accept 中断: ${e.message}")
+                            break
+                        }
+                        // 单连接的任何异常都不得影响 accept 循环
+                        try {
+                            setupClient(sock)
+                        } catch (e: Exception) {
+                            Log.w(TAG, "接入处理异常: ${e.message}")
+                            runCatching { sock.close() }
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "服务端异常, 1s 后重建: ${e.message}")
+                } finally {
+                    runCatching { ss?.close() }
+                    if (server === ss) server = null
+                }
+                if (isRunning) runCatching { Thread.sleep(1000) }
+            }
+        }
+    }
+
+    private fun setupClient(sock: Socket) {
+        sock.soTimeout = 0
+        sock.tcpNoDelay = true
+        // 开 TCP 保活: 盒子被带离/手机热点掉线时, 死连接能被及时发现并回收
+        runCatching { sock.keepAlive = true }
+        val c = Conn(sock)
+        conns += c
+        clientCount = conns.size
+        updateNoti(clientCount)
+        Log.i(TAG, "盒子已接入: ${sock.inetAddress?.hostAddress}")
+
+        thread(name = "relay-writer", isDaemon = true) {
+            val w = try {
+                BufferedWriter(OutputStreamWriter(sock.getOutputStream()))
+            } catch (e: Exception) {
+                removeClient(c)
+                return@thread
+            }
+            c.w = w
+            // 立刻补一帧, 盒子不用等下一秒
+            current?.let { writeLine(w, it.toJson() + "\n") }
+
+            runCatching {
+                sock.getInputStream().bufferedReader().useLines { lines ->
+                    lines.forEach { line ->
+                        val pingTs = WireProtocol.parseTs(line, WireProtocol.CMD_PING)
+                        if (pingTs != null) {
+                            writeLine(w, WireProtocol.pong(pingTs) + "\n")
+                        } else {
+                            val rtt = WireProtocol.parseTs(line, WireProtocol.CMD_RTT)
+                            if (rtt != null) {
+                                lastRttMs = rtt
+                            } else when (WireProtocol.parseCommand(line)) {
+                                WireProtocol.CMD_SLEEP -> parked = true
+                                WireProtocol.CMD_WAKE -> parked = false
                             }
                         }
-                        removeClient(sock, w)
                     }
                 }
-            } catch (e: Exception) {
-                Log.e(TAG, "服务端异常", e)
             }
+            removeClient(c)
+        }
+    }
+
+    /** 所有写 socket 都必须过这把锁：读写线程会并发写同一条连接。 */
+    private val writeLock = Any()
+
+    private fun writeLine(w: BufferedWriter, text: String): Boolean = synchronized(writeLock) {
+        try {
+            w.write(text)
+            w.flush()
+            true
+        } catch (e: Exception) {
+            false
         }
     }
 
@@ -358,30 +440,27 @@ class LocationRelayService : Service() {
                 } catch (e: InterruptedException) {
                     break
                 }
-                val dead = mutableListOf<BufferedWriter>()
-                writers.forEach { w ->
-                    try {
-                        w.write(line)
-                        w.flush()
-                    } catch (e: Exception) {
-                        dead += w
-                    }
+                val dead = mutableListOf<Conn>()
+                conns.forEach { c ->
+                    val w = c.w ?: return@forEach
+                    if (!writeLine(w, line)) dead += c
                 }
                 if (dead.isNotEmpty()) {
-                    writers.removeAll(dead)
-                    clientCount = clients.size
+                    dead.forEach { removeClient(it, updateNoti = false) }
+                    clientCount = conns.size
                     updateNoti(clientCount)
                 }
             }
         }
     }
 
-    private fun removeClient(sock: Socket, w: BufferedWriter) {
-        writers -= w
-        clients -= sock
-        runCatching { sock.close() }
-        clientCount = clients.size
-        updateNoti(clientCount)
+    private fun removeClient(c: Conn, updateNoti: Boolean = true) {
+        conns -= c
+        runCatching { c.w?.close() }
+        runCatching { c.sock.close() }
+        c.w = null
+        clientCount = conns.size
+        if (updateNoti) updateNoti(clientCount)
         Log.i(TAG, "盒子断开, 剩余 $clientCount")
     }
 
@@ -433,8 +512,11 @@ class LocationRelayService : Service() {
         heading = null
         if (Build.VERSION.SDK_INT >= 24) runCatching { lm.unregisterGnssStatusCallback(gnssCallback) }
         runCatching { bleServer?.stop() }
-        writers.forEach { runCatching { it.close() } }
-        clients.forEach { runCatching { it.close() } }
+        conns.forEach { c ->
+            runCatching { c.w?.close() }
+            runCatching { c.sock.close() }
+        }
+        conns.clear()
         runCatching { server?.close() }
         releaseLocks()
         super.onDestroy()
@@ -455,5 +537,9 @@ class LocationRelayService : Service() {
         @Volatile var bleClientCount = 0
         @Volatile var bleError: String? = null
         @Volatile var lastFixSummary: String = "无"
+        /** 盒子回传的链路延时 */
+        @Volatile var lastRtt: Long = 0
+        /** 航向摘要（值 + 来源），供界面显示 */
+        @Volatile var lastHeadingSummary: String = "无"
     }
 }

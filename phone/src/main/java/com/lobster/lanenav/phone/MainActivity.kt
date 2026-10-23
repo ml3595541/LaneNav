@@ -31,6 +31,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var metricPort: TextView
     private lateinit var metricTcp: TextView
     private lateinit var metricBle: TextView
+    private lateinit var metricRtt: TextView
+    private lateinit var metricHeading: TextView
     private lateinit var metricFix: TextView
     private lateinit var warnText: TextView
     private var running = false
@@ -150,6 +152,17 @@ class MainActivity : AppCompatActivity() {
         metricTcp = metricCell(grid2, "TCP 连接")
         metricBle = metricCell(grid2, "BLE 连接")
         statusCard.addView(grid2)
+
+        val grid3 = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = Ui.dp(ctx, 10f) }
+        }
+        metricRtt = metricCell(grid3, "链路延时")
+        metricHeading = metricCell(grid3, "航向")
+        statusCard.addView(grid3)
 
         statusCard.addView(Ui.spacer(ctx, 10f))
         metricFix = TextView(ctx).apply {
@@ -410,6 +423,10 @@ class MainActivity : AppCompatActivity() {
         metricPort.text = "19800"
         metricTcp.text = tcp.toString()
         metricBle.text = ble.toString()
+        // 延时由盒子回传（ping/pong 单时钟测量），自己算不出来
+        val rtt = LocationRelayService.lastRtt
+        metricRtt.text = if (rtt > 0) "${rtt}ms" else "—"
+        metricHeading.text = LocationRelayService.lastHeadingSummary
         metricFix.text = "最近定位：${LocationRelayService.lastFixSummary}"
 
         val err = LocationRelayService.bleError

@@ -140,7 +140,18 @@ class MockRelayService : Service() {
         if (rtt in 0..5000) {
             lastLatencyMs = rtt
             lastChannel = if (fromBle) "BLE" else "TCP"
+            // 延时只有盒子能算（单时钟），回传给手机供界面显示
+            sendRaw(WireProtocol.rtt(rtt), useBle = fromBle)
         }
+    }
+
+    /** 发一行原始 JSON（ping/pong/rtt 这类非命令报文） */
+    private fun sendRaw(text: String, useBle: Boolean = false) {
+        if (useBle) {
+            if (bleClient?.sendCommand(text) == true) return
+        }
+        val w = out ?: return
+        runCatching { w.write(text + "\n"); w.flush() }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
@@ -227,6 +238,8 @@ class MockRelayService : Service() {
         )
         phoneSatsUsed = pkt.sats
         phoneSatsTotal = if (pkt.satsTotal > 0) pkt.satsTotal else pkt.sats
+        lastBsrc = pkt.bsrc
+        lastBearing = pkt.bearing
         // 不再用 pkt.ts 算延迟（那是两台设备的钟差）。
         // 真实延时由 ping/pong 探针写入 lastLatencyMs。
         rxCount++
@@ -499,6 +512,10 @@ class MockRelayService : Service() {
         @Volatile var bleError: String? = null
         @Volatile var lastChannel: String = "-"
         @Volatile var channelName: String = "both"
+        /** 手机上报的航向来源: sensor / gnss / none */
+        @Volatile var lastBsrc: String = "none"
+        /** 航向角度，0-360 */
+        @Volatile var lastBearing: Float = 0f
 
         fun isRunning(): Boolean = state != State.STOPPED
 

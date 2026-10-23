@@ -10,9 +10,13 @@ object WireProtocol {
     const val CMD_WAKE = "wake"
     const val CMD_PING = "ping"
     const val CMD_PONG = "pong"
+    const val CMD_RTT = "rtt"
     const val DEFAULT_PORT = 19800
 
     fun command(cmd: String): String = """{"cmd":"$cmd"}"""
+
+    /** 盒子把测得的 RTT 回传给手机，供手机界面显示链路延时 */
+    fun rtt(ms: Long): String = """{"cmd":"$CMD_RTT","t":$ms}"""
 
     /**
      * 链路测速探针。

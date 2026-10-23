@@ -16,7 +16,8 @@ data class LocationPacket(
     val vacc: Float,         // 垂直精度 米(API26+)
     val fix: FixType,        // 数据来源: GNSS/融合/推算
     val sats: Int = 0,       // 参与定位的卫星数(usedInFix)
-    val satsTotal: Int = 0   // 可见卫星总数(visible)
+    val satsTotal: Int = 0,  // 可见卫星总数(visible)
+    val bsrc: String = "none" // 航向来源: sensor(传感器) / gnss / none
 ) {
     enum class FixType(val tag: String) {
         GNSS("gnss"),
@@ -42,6 +43,7 @@ data class LocationPacket(
         append(",\"fix\":\"").append(fix.tag).append('"')
         append(",\"sats\":").append(sats)
         append(",\"satsTotal\":").append(satsTotal)
+        append(",\"bsrc\":\"").append(bsrc).append('"')
         append('}')
     }
 
@@ -79,7 +81,8 @@ data class LocationPacket(
                     vacc = num("vacc").toFloat(),
                     fix = FixType.from(str("fix")),
                     sats = num("sats").toInt(),
-                    satsTotal = num("satsTotal").toInt()
+                    satsTotal = num("satsTotal").toInt(),
+                    bsrc = str("bsrc").ifBlank { "none" }
                 )
             } catch (e: Exception) {
                 null
