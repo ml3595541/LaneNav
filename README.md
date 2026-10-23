@@ -262,3 +262,18 @@ BLE 协议要求等上一包 `onNotificationSent` 回调后才能发下一包，
 ---
 
 作者微信：`SnownyC`
+
+## 许可证
+
+本项目采用 **GNU General Public License v3.0** 发布，详见 [LICENSE](LICENSE)。
+
+这意味着你可以自由使用、修改、分发本软件，但如果分发修改后的版本，必须以同样的 GPL-3.0 协议开源。
+
+## 下载
+
+到 [Releases](https://github.com/ml3595541/LaneNav/releases) 页面下载正式签名版 APK：
+
+| 端 | 文件 | 适用 |
+|---|---|---|
+| 手机端 | `LaneNav-phone-*.apk` | Android 11+ |
+| 盒子端 | `LaneNav-box-*.apk` | Android 8.0+ |
