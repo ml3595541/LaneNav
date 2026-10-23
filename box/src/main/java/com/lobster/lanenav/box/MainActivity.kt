@@ -38,6 +38,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var dataText: TextView
     private lateinit var ipField: android.widget.EditText
     private lateinit var portField: android.widget.EditText
+
+    /** 用户主动点过「停止」，本次界面内不再被 onResume 自动拉起 */
+    private var userStopped = false
     private lateinit var ipLabel: TextView
 
     /** 刷新循环专用 Handler，便于统一取消，避免重复循环。 */
@@ -223,7 +226,7 @@ class MainActivity : AppCompatActivity() {
         connCard.addView(seg)
         updateIpVisibility()
 
-        val autoConnect = Ui.checkbox(ctx, "启动时自动连接", cfg.autoConnect, accent)
+        val autoConnect = Ui.checkbox(ctx, "打开应用自动启动（每次进来自动注入）", cfg.autoConnect, accent)
         val bootStart = Ui.checkbox(ctx, "开机自启（盒子常电推荐）", cfg.autoStart, accent)
         val eco = Ui.checkbox(ctx, "省电模式（静止时通知手机降频）", cfg.ecoMode, accent)
         connCard.addView(autoConnect)
@@ -250,6 +253,7 @@ class MainActivity : AppCompatActivity() {
             ui.postDelayed({ startRelay() }, 600)
         })
         btnRow.addView(Ui.ghostButton(ctx, "停止", accent) {
+            userStopped = true
             MockRelayService.requestStop(this)
             ui.postDelayed({ refresh() }, 500)
         })
@@ -399,8 +403,11 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         refresh()
-        val needIp = cfg.channel != "ble"
-        if (cfg.autoConnect && (!needIp || cfg.phoneIp.isNotBlank()) &&
+        // 只有「仅 TCP」模式才硬性要求手机 IP；BLE 与双通道不填 IP 也能先跑起来，
+        // TCP 部分会在服务内部进入 WAIT_CONFIG 等待，不影响 BLE 注入。
+        val ipRequired = cfg.channel == "tcp"
+        if (cfg.autoConnect && !userStopped &&
+            (!ipRequired || cfg.phoneIp.isNotBlank()) &&
             !MockRelayService.isRunning()
         ) {
             startRelay()
@@ -413,6 +420,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startRelay() {
+        userStopped = false
         runCatching {
             ContextCompat.startForegroundService(
                 this, Intent(this, MockRelayService::class.java)

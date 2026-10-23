@@ -11,8 +11,8 @@ android {
         applicationId = "com.lobster.lanenav.box"
         minSdk = 26        // Android 8.0+
         targetSdk = 34
-        versionCode = 10
-        versionName = "0.3.5"
+        versionCode = 11
+        versionName = "0.3.6"
     }
 
     // 正式签名：仅在提供 keystore 路径时启用（由 build.sh --release 注入环境变量）
