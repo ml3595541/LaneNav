@@ -63,6 +63,9 @@ class SensorHeading(ctx: Context) : SensorEventListener {
 
     @Volatile private var running = false
 
+    /** 缓存屏幕旋转角度, 取不到时沿用上次值, 避免回调里反复抛异常 */
+    @Volatile private var cachedRotationDeg = 0f
+
     // 磁偏角修正(真北 = 磁北 + 偏角)
     @Volatile private var declination = 0f
     @Volatile private var lastGeoLat = Double.NaN
@@ -127,6 +130,12 @@ class SensorHeading(ctx: Context) : SensorEventListener {
     }
 
     override fun onSensorChanged(event: SensorEvent) {
+        // 传感器回调频率极高且跑在主线程, 任何未捕获异常都会直接闪退, 统一兜底
+        runCatching { dispatchSensor(event) }
+            .onFailure { Log.w(TAG, "传感器回调异常: ${it.message}") }
+    }
+
+    private fun dispatchSensor(event: SensorEvent) {
         when (event.sensor.type) {
             Sensor.TYPE_ROTATION_VECTOR -> {
                 val r = FloatArray(9)
@@ -182,14 +191,27 @@ class SensorHeading(ctx: Context) : SensorEventListener {
         if (source.startsWith("传感器")) source = "传感器"
     }
 
+    /**
+     * 屏幕旋转补偿。
+     *
+     * 注意: Service/Application 这类非可视化 Context 在 Android 11(API30) 以上调用
+     * Context.getDisplay() 会抛 UnsupportedOperationException, 而传感器回调触发极快,
+     * 一抛异常就是整个进程闪退。因此这里改用 WindowManager.defaultDisplay 并且全程兜底。
+     */
     private fun displayRotationDegrees(): Float {
-        val rot = appCtx.display?.rotation ?: Surface.ROTATION_0
-        return when (rot) {
-            Surface.ROTATION_90 -> 90f
-            Surface.ROTATION_180 -> 180f
-            Surface.ROTATION_270 -> 270f
-            else -> 0f
-        }
+        val deg = runCatching {
+            val wm = appCtx.getSystemService(Context.WINDOW_SERVICE) as? android.view.WindowManager
+            @Suppress("DEPRECATION")
+            val rot = wm?.defaultDisplay?.rotation ?: Surface.ROTATION_0
+            when (rot) {
+                Surface.ROTATION_90 -> 90f
+                Surface.ROTATION_180 -> 180f
+                Surface.ROTATION_270 -> 270f
+                else -> 0f
+            }
+        }.getOrDefault(cachedRotationDeg)
+        cachedRotationDeg = deg
+        return deg
     }
 
     private fun lowPass(input: FloatArray, output: FloatArray) {
