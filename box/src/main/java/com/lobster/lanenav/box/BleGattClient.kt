@@ -21,6 +21,7 @@ import android.util.Log
 import com.lobster.lanenav.shared.BleFrames
 import com.lobster.lanenav.shared.BleProtocol
 import com.lobster.lanenav.shared.LocationPacket
+import com.lobster.lanenav.shared.WireProtocol
 
 /**
  * 盒子端 BLE GATT Client。
@@ -46,6 +47,8 @@ class BleGattClient(private val ctx: Context) {
 
     /** 收到完整定位帧 */
     var onPacket: ((LocationPacket) -> Unit)? = null
+    /** 收到测速回包（携带原始发出时刻） */
+    var onPong: ((Long) -> Unit)? = null
     /** 连接建立（MTU 协商+通知开启完成） */
     var onReady: (() -> Unit)? = null
     /** 断开回调，外层据此重连 */
@@ -119,6 +122,11 @@ class BleGattClient(private val ctx: Context) {
                 return
             }
             g.setCharacteristicNotification(dataChar, true)
+            // 高优先级连接：默认连接间隔 30-50ms，会造成每包都攒一两帧的迟滞。
+            // HIGH 拨到 11-15ms，在地图跟车上差别很明显。
+            runCatching {
+                g.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
+            }
             if (Build.VERSION.SDK_INT >= 33) {
                 g.writeDescriptor(cccd, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
             } else {
@@ -170,6 +178,12 @@ class BleGattClient(private val ctx: Context) {
         if (characteristic.uuid != BleProtocol.CHAR_DATA_UUID) return
         val full = assembler.feed(value) ?: return
         val text = String(full, Charsets.UTF_8)
+        // 测速回包优先处理：它不是定位 JSON，交给 fromJson 会被丢弃。
+        val pongTs = WireProtocol.parseTs(text, WireProtocol.CMD_PONG)
+        if (pongTs != null) {
+            onPong?.invoke(pongTs)
+            return
+        }
         LocationPacket.fromJson(text)?.let { onPacket?.invoke(it) }
     }
 

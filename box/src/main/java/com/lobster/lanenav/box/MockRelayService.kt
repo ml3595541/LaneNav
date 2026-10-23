@@ -50,6 +50,9 @@ class MockRelayService : Service() {
 
     private var consecutiveFail = 0
 
+    /** 已发出但未收到回包的 ping 时刻，用于计算真实 RTT */
+    private val pendingPings = java.util.concurrent.ConcurrentHashMap<Long, Boolean>()
+
     /**
      * 断流期间是否已主动交还真实 GPS。
      *
@@ -103,6 +106,41 @@ class MockRelayService : Service() {
             thread(name = "ble-watchdog", isDaemon = true) { bleWatchdog() }
         }
         thread(name = "silence-watchdog", isDaemon = true) { silenceWatchdog() }
+        thread(name = "rtt-probe", isDaemon = true) { rttProbe() }
+    }
+
+    // ---------------- 真实链路延时 ----------------
+
+    /**
+     * 单时钟 RTT 探针。
+     *
+     * 原来的「延迟」= 盒子时钟 - 手机GPS时刻，两端从未对时，
+     * 钟差 2-3 秒就直接显示 2-3 秒，跟链路快慢无关。
+     * 现在发 ping 带上盒子自己的时刻，手机原样回 pong，
+     * 收到后用同一个时钟相减，得到的才是真实往返延迟。
+     */
+    private fun rttProbe() {
+        while (running) {
+            sleepQuiet(1000)
+            if (!running) break
+            if (!bleReady && out == null) continue
+            val t = System.currentTimeMillis()
+            pendingPings[t] = true
+            // 只保留最近几笔，避免永远收不到回包时无上限增长
+            if (pendingPings.size > 8) {
+                pendingPings.keys.minOrNull()?.let { pendingPings.remove(it) }
+            }
+            sendCommand(WireProtocol.ping(t))
+        }
+    }
+
+    private fun onPong(sentAt: Long, fromBle: Boolean) {
+        if (pendingPings.remove(sentAt) != true) return
+        val rtt = System.currentTimeMillis() - sentAt
+        if (rtt in 0..5000) {
+            lastLatencyMs = rtt
+            lastChannel = if (fromBle) "BLE" else "TCP"
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
@@ -112,6 +150,7 @@ class MockRelayService : Service() {
     private fun startBle() {
         val c = BleGattClient(this)
         c.onPacket = { pkt -> handlePacket(pkt, fromBle = true) }
+        c.onPong = { sentAt -> onPong(sentAt, fromBle = true) }
         c.onReady = {
             onConnected()
             bleReady = true
@@ -188,7 +227,8 @@ class MockRelayService : Service() {
         )
         phoneSatsUsed = pkt.sats
         phoneSatsTotal = if (pkt.satsTotal > 0) pkt.satsTotal else pkt.sats
-        lastLatencyMs = now - pkt.ts
+        // 不再用 pkt.ts 算延迟（那是两台设备的钟差）。
+        // 真实延时由 ping/pong 探针写入 lastLatencyMs。
         rxCount++
         lastChannel = if (fromBle) "BLE" else "TCP"
 
@@ -276,19 +316,26 @@ class MockRelayService : Service() {
                     var statSumDelay = 0L
 
                     for (line in lines) {
+                        // 测速回包优先处理：pong 不是定位 JSON
+                        val pongTs = WireProtocol.parseTs(line, WireProtocol.CMD_PONG)
+                        if (pongTs != null) {
+                            onPong(pongTs, fromBle = false)
+                            continue
+                        }
+
                         val pkt = LocationPacket.fromJson(line)
                         if (pkt == null) { statBad++; continue }
 
                         val now = System.currentTimeMillis()
                         lastRxMs = now
                         statCount++
-                        statSumDelay += (now - pkt.ts).coerceIn(0, 5000)
 
                         handlePacket(pkt, fromBle = false)
 
                         if (statCount % 30 == 0) {
-                            avgLatency = statSumDelay / statCount
-                            Log.i(TAG, "rx=$statCount bad=$statBad avgDelay=${avgLatency}ms")
+                            // 真延时由 ping/pong 写入，不再用两台设备的钟差
+                            avgLatency = lastLatencyMs
+                            Log.i(TAG, "rx=$statCount bad=$statBad rtt=${lastLatencyMs}ms")
                         }
                     }
                     Log.i(TAG, "连接结束 rx=$statCount bad=$statBad")

@@ -205,11 +205,26 @@ class BleGattServer(private val ctx: Context) {
 
     /** 推送一条定位。自动按 MTU 分包。 */
     fun push(pkt: LocationPacket) {
+        sendRaw(pkt.toJson())
+    }
+
+    /**
+     * 发送任意文本（定位 JSON 或 pong）。
+     *
+     * 队列积压时直接清空：5Hz 下若 MTU 没协商上（每帧 9 个包），
+     * 队列会无限增长，旧坐标迟早把新坐标压在后面 —— 表现为「延迟越跑越大」。
+     * 宁可丢旧帧，也不能让延迟累积。
+     */
+    fun sendRaw(text: String) {
         if (subscribers.isEmpty()) return
-        val bytes = pkt.toJson().toByteArray(Charsets.UTF_8)
+        val bytes = text.toByteArray(Charsets.UTF_8)
         frameId = (frameId + 1) and 0xFF
         val chunks = BleFrames.split(bytes, chunkSize, frameId)
         if (chunks.isEmpty()) return
+        if (queue.size > MAX_QUEUE_PACKETS) {
+            queue.clear()
+            Log.w(TAG, "BLE 队列积压，丢弃旧帧（MTU=$chunkSize）")
+        }
         queue.addAll(chunks)
         pumpQueue()
     }
@@ -255,5 +270,7 @@ class BleGattServer(private val ctx: Context) {
 
     companion object {
         private const val TAG = "LaneNavPhone"
+        /** 允许多少个待发 BLE 包积压，超过就丢旧帧 */
+        private const val MAX_QUEUE_PACKETS = 80
     }
 }

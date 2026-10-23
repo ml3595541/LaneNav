@@ -68,7 +68,11 @@ class LocationRelayService : Service() {
     @Volatile private var parked = false
 
     private var lastPushMs = 0L
-    private val minIntervalMs = 1000L      // 正常 1Hz
+    /** 上次刷新通知的时刻，用于限频 */
+    private var lastNotiMs = 0L
+    // 5Hz 采样。原来 1Hz + 限流 1000ms 会因抖动一次跳过一帧，
+    // 实际退化成 0.5Hz —— 这是 2s 视觉延迟的主因。
+    private val minIntervalMs = 200L
     private val parkedIntervalMs = 10_000L // 停车省电模式
 
     private val gnssCallback = object : GnssStatus.Callback() {
@@ -158,9 +162,15 @@ class LocationRelayService : Service() {
     private fun startBle() {
         val ble = BleGattServer(this)
         ble.onCommand = { text ->
-            when (WireProtocol.parseCommand(text)) {
-                WireProtocol.CMD_SLEEP -> parked = true
-                WireProtocol.CMD_WAKE -> parked = false
+            val pingTs = WireProtocol.parseTs(text, WireProtocol.CMD_PING)
+            if (pingTs != null) {
+                // 回 pong 走数据通道，盒子用自己的时钟算 RTT
+                runCatching { ble.sendRaw(WireProtocol.pong(pingTs)) }
+            } else {
+                when (WireProtocol.parseCommand(text)) {
+                    WireProtocol.CMD_SLEEP -> parked = true
+                    WireProtocol.CMD_WAKE -> parked = false
+                }
             }
         }
         if (ble.start()) {
@@ -182,10 +192,10 @@ class LocationRelayService : Service() {
     private fun startLocationUpdates() {
         try {
             lm.requestLocationUpdates(
-                LocationManager.GPS_PROVIDER, 1000L, 0f, listener, mainLooper
+                LocationManager.GPS_PROVIDER, 200L, 0f, listener, mainLooper
             )
             lm.requestLocationUpdates(
-                LocationManager.NETWORK_PROVIDER, 2000L, 0f, listener, mainLooper
+                LocationManager.NETWORK_PROVIDER, 1000L, 0f, listener, mainLooper
             )
             if (Build.VERSION.SDK_INT >= 24) {
                 lm.registerGnssStatusCallback(gnssCallback, null)
@@ -233,7 +243,13 @@ class LocationRelayService : Service() {
         push(pkt)
         bleServer?.push(pkt)
         bleClientCount = bleServer?.clientCount ?: 0
-        updateNoti(clients.size + bleClientCount)
+        // 5Hz 下每秒刷 5 次通知太浪费（跨进程 Binder 调用，主线程上执行）。
+        // 限制到最多 1 秒一次。
+        val nowNoti = System.currentTimeMillis()
+        if (nowNoti - lastNotiMs >= 1000L) {
+            lastNotiMs = nowNoti
+            updateNoti(clients.size + bleClientCount)
+        }
     }
 
     // ---------------- 航向 ----------------
@@ -298,9 +314,17 @@ class LocationRelayService : Service() {
                         runCatching {
                             sock.getInputStream().bufferedReader().useLines { lines ->
                                 lines.forEach { line ->
-                                    when (WireProtocol.parseCommand(line)) {
-                                        WireProtocol.CMD_SLEEP -> parked = true
-                                        WireProtocol.CMD_WAKE -> parked = false
+                                    val pingTs = WireProtocol.parseTs(line, WireProtocol.CMD_PING)
+                                    if (pingTs != null) {
+                                        runCatching {
+                                            w.write(WireProtocol.pong(pingTs) + "\n")
+                                            w.flush()
+                                        }
+                                    } else {
+                                        when (WireProtocol.parseCommand(line)) {
+                                            WireProtocol.CMD_SLEEP -> parked = true
+                                            WireProtocol.CMD_WAKE -> parked = false
+                                        }
                                     }
                                 }
                             }
