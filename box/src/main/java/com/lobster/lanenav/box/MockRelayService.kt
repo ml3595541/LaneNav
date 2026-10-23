@@ -42,6 +42,19 @@ class MockRelayService : Service() {
 
     private var consecutiveFail = 0
 
+    /**
+     * 断流期间是否已主动交还真实 GPS。
+     *
+     * 背景: 注入用的 provider 名就是系统真实 GPS 名("gps"), 一旦注册就会
+     * **遮蔽盒子自带 GPS**。如果手机断连/被带走而提供器没释放, 高德就再也
+     * 收不到新的定位, 画面永远停在最后一次坐标上 —— 开车时会误以为导航正常。
+     * 因此断流超时后主动 release, 让真实 GPS 接管; 手机重新发来数据再重新接管。
+     */
+    @Volatile private var releasedForSilence = false
+
+    /** 服务启动时间, 用于「从未收到数据」时的断流基准 */
+    private val serviceStartedAt = System.currentTimeMillis()
+
     override fun onCreate() {
         super.onCreate()
         cfg = BoxConfig(this)
@@ -73,6 +86,7 @@ class MockRelayService : Service() {
         if (ch == "ble") {
             thread(name = "ble-watchdog", isDaemon = true) { bleWatchdog() }
         }
+        thread(name = "silence-watchdog", isDaemon = true) { silenceWatchdog() }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
@@ -138,6 +152,13 @@ class MockRelayService : Service() {
     private fun handlePacket(pkt: LocationPacket, fromBle: Boolean = false) {
         val now = System.currentTimeMillis()
 
+        // 断流期间已交还真实 GPS，手机数据回来后重新接管
+        if (releasedForSilence) {
+            releasedForSilence = false
+            Log.i(TAG, "手机数据恢复，重新接管系统定位")
+            updateNoti("手机数据恢复 · 重新接管定位")
+        }
+
         injector.inject(pkt)
         lastPacketAt = now
         lastFixText = String.format(
@@ -155,6 +176,31 @@ class MockRelayService : Service() {
     }
 
     // ---------------- 连接循环 ----------------
+
+    /**
+     * 断流保护。
+     *
+     * 注入用的 provider 名就是系统真实 GPS 名（"gps"），注册后会把盒子自带天线
+     * 遮蔽掉。手机断连、被带下车、或进程被系统回收后服务重建时，若提供器仍在，
+     * 高德会永远停在最后一次坐标 —— 开车时会误以为导航正常。
+     *
+     * 因此超过 SILENCE_RELEASE_MS 没有新数据就主动 release，让真实 GPS 接管。
+     */
+    private fun silenceWatchdog() {
+        while (running) {
+            sleepQuiet(2000)
+            if (!running) break
+            val ref = if (lastPacketAt > 0) lastPacketAt else serviceStartedAt
+            val silentMs = System.currentTimeMillis() - ref
+            if (silentMs > SILENCE_RELEASE_MS && injector.isReady && !releasedForSilence) {
+                releasedForSilence = true
+                runCatching { injector.release() }
+                state = State.DISCONNECTED
+                updateNoti("手机 ${silentMs / 1000}s 无数据 · 已交还真实 GPS")
+                Log.w(TAG, "断流 ${silentMs}ms，已释放模拟提供器让真实 GPS 接管")
+            }
+        }
+    }
 
     private fun connectLoop() {
         while (running) {
@@ -336,6 +382,8 @@ class MockRelayService : Service() {
         private const val TAG = "LaneNavBox"
         private const val CHANNEL = "relay"
         private const val NOTI_ID = 2001
+        /** 多少毫秒无数据后交还真实 GPS */
+        private const val SILENCE_RELEASE_MS = 15_000L
 
         @Volatile var state: State = State.STOPPED
         @Volatile var lastFixText: String = "无"

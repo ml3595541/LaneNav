@@ -24,6 +24,13 @@ class MockLocationInjector(private val ctx: Context) {
     private var ready = false
     private var lastNanos = 0L
 
+    /** 提供器是否已注册(影子模式下真实 GPS 会被遮蔽) */
+    val isReady: Boolean get() = ready
+
+    /** 最近一次注册成功的时间, 用于断流超时判定 */
+    @Volatile var preparedAt: Long = 0L
+        private set
+
     /** 注册测试提供器。失败(无 mock 权限)返回 false 并给出原因。 */
     fun prepare(): Pair<Boolean, String> {
         if (ready) return true to "已就绪"
@@ -46,6 +53,7 @@ class MockLocationInjector(private val ctx: Context) {
             )
             lm.setTestProviderEnabled(PROVIDER, true)
             ready = true
+            preparedAt = System.currentTimeMillis()
             true to "模拟位置提供器已就绪"
         } catch (e: SecurityException) {
             Log.e(TAG, "无模拟位置权限", e)
@@ -122,6 +130,7 @@ class MockLocationInjector(private val ctx: Context) {
         runCatching { lm.setTestProviderEnabled(PROVIDER, false) }
         runCatching { lm.removeTestProvider(PROVIDER) }
         ready = false
+        preparedAt = 0L
     }
 
     private fun normalizeBearing(b: Float): Float {
