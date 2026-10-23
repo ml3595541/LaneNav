@@ -9,6 +9,7 @@ import android.content.Intent
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.net.wifi.WifiManager
 import android.content.pm.ServiceInfo
 import androidx.core.app.ServiceCompat
 import android.util.Log
@@ -35,6 +36,13 @@ class MockRelayService : Service() {
     private lateinit var sourceMonitor: SourceMonitor
     private var bleClient: BleGattClient? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    /**
+     * WiFi 高性能锁。
+     *
+     * 盒子连的是手机热点, 屏幕一黑系统就会让 WiFi 进省电模式: 收包变慢、
+     * TCP 心跳超时、甚至直接断。这是 WiFi 通道「数据迟滞 + 断连」的主因之一。
+     */
+    private var wifiLock: WifiManager.WifiLock? = null
 
     @Volatile private var running = false
     @Volatile private var socket: Socket? = null
@@ -51,6 +59,14 @@ class MockRelayService : Service() {
      * 因此断流超时后主动 release, 让真实 GPS 接管; 手机重新发来数据再重新接管。
      */
     @Volatile private var releasedForSilence = false
+
+    /**
+     * 已注入的最新帧时间戳，用于双通道去重。
+     *
+     * both 模式下同一条定位会同时经 TCP 和 BLE 到达，不去重就会被注入两次，
+     * 白耗一半 CPU 且可能造成坐标微抖动。
+     */
+    @Volatile private var lastInjectedTs: Long = 0L
 
     /** 服务启动时间, 用于「从未收到数据」时的断流基准 */
     private val serviceStartedAt = System.currentTimeMillis()
@@ -152,6 +168,10 @@ class MockRelayService : Service() {
     private fun handlePacket(pkt: LocationPacket, fromBle: Boolean = false) {
         val now = System.currentTimeMillis()
 
+        // 双通道去重: 同一帧（时间戳不新）直接丢弃
+        if (pkt.ts > 0 && pkt.ts <= lastInjectedTs) return
+        if (pkt.ts > 0) lastInjectedTs = pkt.ts
+
         // 断流期间已交还真实 GPS，手机数据回来后重新接管
         if (releasedForSilence) {
             releasedForSilence = false
@@ -192,12 +212,18 @@ class MockRelayService : Service() {
             if (!running) break
             val ref = if (lastPacketAt > 0) lastPacketAt else serviceStartedAt
             val silentMs = System.currentTimeMillis() - ref
-            if (silentMs > SILENCE_RELEASE_MS && injector.isReady && !releasedForSilence) {
+
+            // 省电模式下手机降到 0.1Hz（10s 一帧），阈值必须放宽，
+            // 否则两帧之间就会被误判成断流 —— 归还真 GPS 后马上又收回，
+            // 表现为导航画面反复抽搐。正常 1Hz 仍按 15s 判。
+            val threshold = if (ecoSent) SILENCE_RELEASE_ECO_MS else SILENCE_RELEASE_MS
+
+            if (silentMs > threshold && injector.isReady && !releasedForSilence) {
                 releasedForSilence = true
                 runCatching { injector.release() }
                 state = State.DISCONNECTED
                 updateNoti("手机 ${silentMs / 1000}s 无数据 · 已交还真实 GPS")
-                Log.w(TAG, "断流 ${silentMs}ms，已释放模拟提供器让真实 GPS 接管")
+                Log.w(TAG, "断流 ${silentMs}ms(阈值${threshold}ms)，已释放模拟提供器让真实 GPS 接管")
             }
         }
     }
@@ -219,6 +245,10 @@ class MockRelayService : Service() {
                 val s = Socket()
                 s.tcpNoDelay = true
                 s.connect(InetSocketAddress(ip, cfg.port), 3000)
+                // 读超时：手机热点掉线、手机休眠或路由消失时，连接会「假死」——
+                // 它仍然看起来是已连接，但再也没有数据。原来没有超时，
+                // BufferedReader 会永久阻塞，直到进程被杀，所以断连后永远不会重连。
+                s.soTimeout = TCP_READ_TIMEOUT_MS
                 socket = s
 
                 val (ok, msg) = injector.prepare()
@@ -331,6 +361,18 @@ class MockRelayService : Service() {
             setReferenceCounted(false)
             runCatching { acquire(12 * 60 * 60 * 1000L) }
         }
+
+        // WiFi 高性能锁: 盒子熄屏后若不加此锁, 系统会让 WiFi 进省电模式,
+        // 导致收包延迟、TCP 连接被回收。
+        runCatching {
+            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            wifiLock = wm.createWifiLock(
+                WifiManager.WIFI_MODE_FULL_HIGH_PERF, "LaneNav::relay-wifi"
+            ).apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        }.onFailure { Log.w(TAG, "WifiLock 获取失败: ${it.message}") }
     }
 
     private fun sleepQuiet(ms: Long) {
@@ -344,6 +386,8 @@ class MockRelayService : Service() {
         runCatching { sourceMonitor.stop() }
         runCatching { injector.release() }
         runCatching { wakeLock?.takeIf { it.isHeld }?.release() }
+        runCatching { wifiLock?.takeIf { it.isHeld }?.release() }
+        wifiLock = null
         state = State.STOPPED
         super.onDestroy()
     }
@@ -382,8 +426,12 @@ class MockRelayService : Service() {
         private const val TAG = "LaneNavBox"
         private const val CHANNEL = "relay"
         private const val NOTI_ID = 2001
-        /** 多少毫秒无数据后交还真实 GPS */
+        /** 多少毫秒无数据后交还真实 GPS（正常 1Hz） */
         private const val SILENCE_RELEASE_MS = 15_000L
+        /** 省电模式（0.1Hz）下的断流阈值，需大于手机 10s 的推送间隔 */
+        private const val SILENCE_RELEASE_ECO_MS = 40_000L
+        /** TCP 读超时：超过此时长无数据即认定连接假死，主动断开重连 */
+        private const val TCP_READ_TIMEOUT_MS = 30_000
 
         @Volatile var state: State = State.STOPPED
         @Volatile var lastFixText: String = "无"

@@ -10,8 +10,10 @@ import android.location.GnssStatus
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.ServiceCompat
 import android.content.pm.ServiceInfo
@@ -22,6 +24,7 @@ import java.io.OutputStreamWriter
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
 
@@ -44,6 +47,20 @@ class LocationRelayService : Service() {
     private var server: ServerSocket? = null
     private val clients = CopyOnWriteArrayList<Socket>()
     private val writers = CopyOnWriteArrayList<BufferedWriter>()
+
+    /**
+     * 发送队列。
+     *
+     * 定位回调跑在主线程上, 原来直接在回调里写 socket —— 一旦 WiFi 卡顿,
+     * 主线程会被阻塞, 造成界面卡死、回调延迟, 且多个连接并发写同一个
+     * BufferedWriter 会拆包(JSON 行被截断), 盒子端解析失败就丢帧。
+     *
+     * 改为单一发送线程串行写, 队列满时丢弃旧帧保新帧, 避免延迟累积。
+     */
+    private val txQueue = LinkedBlockingQueue<String>(32)
+
+    private var wifiLock: WifiManager.WifiLock? = null
+    private var wakeLock: PowerManager.WakeLock? = null
 
     @Volatile private var current: LocationPacket? = null
     @Volatile private var sats = 0
@@ -83,12 +100,49 @@ class LocationRelayService : Service() {
 
         if (channel == "tcp" || channel == "both") {
             startServer()
+            startTxLoop()
         }
         if (channel == "ble" || channel == "both") {
             startBle()
         }
+        acquireLocks()
         startHeading()
         startLocationUpdates()
+    }
+
+    /**
+     * 拿住 WiFi 和 CPU 锁。
+     *
+     * 这两把锁是 WiFi 通道卡顿/断连的主因:
+     *  - 没有 WifiLock: 屏幕一黑, 系统就让 WiFi 进省电模式, 发包变慢甚至断
+     *  - 没有 WakeLock: 手机休眠时 CPU 降频/停核, 定时器和写线程都被挂起
+     * 双通道时 BLE 和 WiFi 共用2.4G 射频, 也需要它们都保持活跃才稳。
+     */
+    private fun acquireLocks() {
+        runCatching {
+            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            wifiLock = wm.createWifiLock(
+                WifiManager.WIFI_MODE_FULL_HIGH_PERF, "LaneNav::wifi"
+            ).apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        }.onFailure { Log.w(TAG, "WifiLock 获取失败: ${it.message}") }
+
+        runCatching {
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "LaneNav::phone").apply {
+                setReferenceCounted(false)
+                acquire(12 * 60 * 60 * 1000L)
+            }
+        }.onFailure { Log.w(TAG, "WakeLock 获取失败: ${it.message}") }
+    }
+
+    private fun releaseLocks() {
+        runCatching { if (wifiLock?.isHeld == true) wifiLock?.release() }
+        wifiLock = null
+        runCatching { if (wakeLock?.isHeld == true) wakeLock?.release() }
+        wakeLock = null
     }
 
     private fun startHeading() {
@@ -226,6 +280,9 @@ class LocationRelayService : Service() {
                     val sock = server?.accept() ?: break
                     sock.soTimeout = 0
                     sock.tcpNoDelay = true
+                    // 开 TCP 保活: 盒子被带离/手机热点掉线时, 死连接能被及时发现
+                    // 并回收, 而不是留着一条看似正常、实则写不出去的管道。
+                    runCatching { sock.keepAlive = true }
                     clients += sock
                     clientCount = clients.size
                     updateNoti(clientCount)
@@ -257,19 +314,41 @@ class LocationRelayService : Service() {
         }
     }
 
+    /**
+     * 投递一帧。只入队不阻塞 —— 定位回调在主线程上, 不能在这里写 socket。
+     * 队列满时丢最旧的一帧: 宁可少一帧, 也不要让延迟不断累积。
+     */
     private fun push(pkt: LocationPacket) {
         val line = pkt.toJson() + "\n"
-        val dead = mutableListOf<BufferedWriter>()
-        writers.forEach { w ->
-            try {
-                w.write(line); w.flush()
-            } catch (e: Exception) {
-                dead += w
-            }
+        while (!txQueue.offer(line)) {
+            txQueue.poll()
         }
-        if (dead.isNotEmpty()) {
-            writers.removeAll(dead)
-            clientCount = clients.size
+    }
+
+    /** 单一发送线程: 串行写所有连接, 避免多线程拆包。 */
+    private fun startTxLoop() {
+        thread(name = "relay-tx", isDaemon = true) {
+            while (true) {
+                val line = try {
+                    txQueue.take()
+                } catch (e: InterruptedException) {
+                    break
+                }
+                val dead = mutableListOf<BufferedWriter>()
+                writers.forEach { w ->
+                    try {
+                        w.write(line)
+                        w.flush()
+                    } catch (e: Exception) {
+                        dead += w
+                    }
+                }
+                if (dead.isNotEmpty()) {
+                    writers.removeAll(dead)
+                    clientCount = clients.size
+                    updateNoti(clientCount)
+                }
+            }
         }
     }
 
@@ -333,6 +412,7 @@ class LocationRelayService : Service() {
         writers.forEach { runCatching { it.close() } }
         clients.forEach { runCatching { it.close() } }
         runCatching { server?.close() }
+        releaseLocks()
         super.onDestroy()
     }
 
