@@ -37,6 +37,8 @@ class LocationRelayService : Service() {
 
     private lateinit var lm: LocationManager
     private var bleServer: BleGattServer? = null
+    /** 手机端传感器航向: 停车/低速时 GNSS 的 bearing 恒为 0, 靠它补车头方向 */
+    private var heading: SensorHeading? = null
     /** 传输通道: tcp / ble / both */
     @Volatile private var channel: String = "both"
     private var server: ServerSocket? = null
@@ -83,7 +85,18 @@ class LocationRelayService : Service() {
         if (channel == "ble" || channel == "both") {
             startBle()
         }
+        startHeading()
         startLocationUpdates()
+    }
+
+    private fun startHeading() {
+        val h = SensorHeading(this)
+        if (h.start()) {
+            heading = h
+            Log.i(TAG, "航向传感器已启动: ${h.source}")
+        } else {
+            Log.w(TAG, "无可用航向传感器, 仅能依赖 GNSS bearing")
+        }
     }
 
     private fun startBle() {
@@ -148,7 +161,7 @@ class LocationRelayService : Service() {
             lat = loc.latitude,
             lon = loc.longitude,
             alt = if (loc.hasAltitude()) loc.altitude else 0.0,
-            bearing = if (loc.hasBearing()) loc.bearing else 0f,
+            bearing = resolveBearing(loc),
             speed = if (loc.hasSpeed()) loc.speed else 0f,
             acc = acc,
             vacc = if (Build.VERSION.SDK_INT >= 26 && loc.hasVerticalAccuracy())
@@ -158,12 +171,43 @@ class LocationRelayService : Service() {
         )
         current = pkt
         lastFixSummary = String.format(
-            "%.6f,%.6f ±%.1fm %s", pkt.lat, pkt.lon, pkt.acc, pkt.fix.tag
+            "%.6f,%.6f ±%.1fm %s %s", pkt.lat, pkt.lon, pkt.acc, pkt.fix.tag, headingTag()
         )
         push(pkt)
         bleServer?.push(pkt)
         bleClientCount = bleServer?.clientCount ?: 0
         updateNoti(clients.size + bleClientCount)
+    }
+
+    // ---------------- 航向 ----------------
+
+    /**
+     * 决定这一帧用哪个航向:
+     *  - 车速够快且有 GNSS 航向 → 用 GNSS(方向准确, 不受车身磁场干扰)
+     *  - 低速/停车/无 GNSS 航向 → 用手机传感器(陀螺仪+磁力计), 否则车头会卡在正北
+     */
+    private fun resolveBearing(loc: Location): Float {
+        val h = heading
+        val speed = if (loc.hasSpeed()) loc.speed else 0f
+        val gnssOk = loc.hasBearing() && speed >= GNSS_BEARING_MIN_SPEED
+
+        if (gnssOk) return loc.bearing
+
+        // 低速: 优先传感器
+        if (h != null && h.isValid()) {
+            h.setLocation(loc.latitude, loc.longitude, if (loc.hasAltitude()) loc.altitude else 0.0)
+            return h.headingDeg
+        }
+
+        // 传感器不可用但 GNSS 有航向值(即使低速), 也用上
+        return if (loc.hasBearing()) loc.bearing else 0f
+    }
+
+    /** UI 上显示航向来源, 便于现场判断到底在用哪一路。 */
+    private fun headingTag(): String {
+        val h = heading ?: return "无航向传感器"
+        return if (h.isValid()) String.format("航向%.0f°(传感器)", h.headingDeg)
+        else "航向无(传感器未就绪)"
     }
 
     // ---------------- TCP Server ----------------
@@ -279,6 +323,8 @@ class LocationRelayService : Service() {
     override fun onDestroy() {
         isRunning = false
         runCatching { lm.removeUpdates(listener) }
+        heading?.stop()
+        heading = null
         if (Build.VERSION.SDK_INT >= 24) runCatching { lm.unregisterGnssStatusCallback(gnssCallback) }
         runCatching { bleServer?.stop() }
         writers.forEach { runCatching { it.close() } }
@@ -293,6 +339,9 @@ class LocationRelayService : Service() {
         private const val TAG = "LaneNavPhone"
         private const val CHANNEL = "relay"
         private const val NOTI_ID = 1001
+
+        /** 车速高于此值(m/s)且 GNSS 有航向时优先用 GNSS; 低于则改用传感器。约 13km/h */
+        private const val GNSS_BEARING_MIN_SPEED = 3.6f
 
         @Volatile var isRunning = false
         @Volatile var clientCount = 0
