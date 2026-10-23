@@ -141,9 +141,12 @@ class MockRelayService : Service() {
         injector.inject(pkt)
         lastPacketAt = now
         lastFixText = String.format(
-            "%.6f, %.6f · ±%.1fm · %s · %d星",
-            pkt.lat, pkt.lon, pkt.acc, pkt.fix.tag, pkt.sats
+            "%.6f, %.6f · ±%.1fm · %s · %d/%d星",
+            pkt.lat, pkt.lon, pkt.acc, pkt.fix.tag, pkt.sats,
+            if (pkt.satsTotal > 0) pkt.satsTotal else pkt.sats
         )
+        phoneSatsUsed = pkt.sats
+        phoneSatsTotal = if (pkt.satsTotal > 0) pkt.satsTotal else pkt.sats
         lastLatencyMs = now - pkt.ts
         rxCount++
         lastChannel = if (fromBle) "BLE" else "TCP"
@@ -345,6 +348,9 @@ class MockRelayService : Service() {
         /** 系统实际定位来源: 手机 GPS / 盒子自带 GPS / 无定位 */
         @Volatile var srcLabel: String = "检测中"
         @Volatile var srcSats: String = "0/0"
+        /** 手机端上报的卫星数: used / total */
+        @Volatile var phoneSatsUsed: Int = 0
+        @Volatile var phoneSatsTotal: Int = 0
         @Volatile var srcAgeSec: Long = -1
         @Volatile var bleReady = false
         @Volatile var bleError: String? = null

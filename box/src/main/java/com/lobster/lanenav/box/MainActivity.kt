@@ -475,10 +475,14 @@ class MainActivity : AppCompatActivity() {
         if (!hasLocationPermission()) {
             metricSats.text = "未授予定位权限，无法检测（不采集位置）"
         } else {
-            val sats = if (MockRelayService.srcSats == "0/0") "—"
+            val boxSats = if (MockRelayService.srcSats == "0/0") "—"
             else MockRelayService.srcSats + " 星"
+            val used = MockRelayService.phoneSatsUsed
+            val total = MockRelayService.phoneSatsTotal
+            val phoneSats = if (used > 0 || total > 0)
+                "手机 $used/$total 星" else "手机 —"
             metricSats.text = buildString {
-                append("盒子天线 $sats")
+                append("盒子天线 $boxSats · $phoneSats")
                 if (srcAge >= 0) append(" · ${srcAge}s 前更新")
             }
         }

@@ -47,6 +47,7 @@ class LocationRelayService : Service() {
 
     @Volatile private var current: LocationPacket? = null
     @Volatile private var sats = 0
+    @Volatile private var satsTotal = 0
     @Volatile private var parked = false
 
     private var lastPushMs = 0L
@@ -60,6 +61,7 @@ class LocationRelayService : Service() {
                 if (status.usedInFix(i)) used++
             }
             sats = used
+            satsTotal = status.satelliteCount
         }
     }
 
@@ -167,7 +169,8 @@ class LocationRelayService : Service() {
             vacc = if (Build.VERSION.SDK_INT >= 26 && loc.hasVerticalAccuracy())
                 loc.verticalAccuracyMeters else acc * 2,
             fix = fix,
-            sats = sats
+            sats = sats,
+            satsTotal = satsTotal
         )
         current = pkt
         lastFixSummary = String.format(

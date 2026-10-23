@@ -88,6 +88,21 @@ class MockLocationInjector(private val ctx: Context) {
                     bearingAccuracyDegrees = 5f
                 }
                 // isFromMockProvider 为只读属性，由系统在 setTestProviderLocation 时自动置位
+
+                // 卫星数写进 extras：GnssStatus 由系统 GNSS HAL 驱动提供，
+                // 模拟位置提供器无法向其注入卫星，因此只能走 extras 这条非标准通道，
+                // 供读取 extras 的导航/测试应用使用。
+                extras = android.os.Bundle().apply {
+                    putInt("satellites", p.sats)
+                    putInt("satelliteCount", p.sats)
+                    putInt("sats", p.sats)
+                    putInt("satsUsed", p.sats)
+                    putInt("satsTotal", if (p.satsTotal > 0) p.satsTotal else p.sats)
+                    putInt("satellites_visible", if (p.satsTotal > 0) p.satsTotal else p.sats)
+                    putInt("satellites_used", p.sats)
+                    putInt("maxCn0", 0)
+                    putInt("meanCn0", 0)
+                }
             }
             lm.setTestProviderLocation(PROVIDER, loc)
             lastError = null
