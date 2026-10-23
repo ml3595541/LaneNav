@@ -47,6 +47,12 @@ android {
         targetCompatibility = JavaVersion.VERSION_1_8
     }
     kotlinOptions { jvmTarget = "1.8" }
+
+    // 本 App 的用途就是向系统注入模拟位置，ACCESS_MOCK_LOCATION 必须出现在正式包中，
+    // 否则车机「开发者选项 → 选择模拟位置信息应用」列表里不会出现本应用。
+    lint {
+        disable += "MockLocation"
+    }
 }
 
 dependencies {
