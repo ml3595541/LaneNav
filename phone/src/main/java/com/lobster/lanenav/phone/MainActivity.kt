@@ -7,6 +7,8 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Typeface
+import android.net.Uri
+import android.provider.Settings
 import android.os.Build
 import android.os.Bundle
 import android.view.Gravity
@@ -19,6 +21,7 @@ import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import com.lobster.lanenav.uikit.PermCheck
 import com.lobster.lanenav.uikit.Segmented
 import com.lobster.lanenav.uikit.Ui
 
@@ -63,6 +66,14 @@ class MainActivity : AppCompatActivity() {
     private lateinit var logBody: TextView
     private lateinit var logEmpty: TextView
     private var lastLogVersion = -1
+
+    // ---------- 设置页 · 权限自检 ----------
+    private var permBox: LinearLayout? = null
+    private var permSummary: TextView? = null
+    private var lastPermSig = ""
+
+    /** 权限申请期间暂存「授予后要做什么」 */
+    private var pendingAction: (() -> Unit)? = null
 
     // ---------- 页面容器 ----------
     private lateinit var content: FrameLayout
@@ -133,6 +144,10 @@ class MainActivity : AppCompatActivity() {
         when (i) {
             BottomNav.TAB_SAT -> refreshSat()
             BottomNav.TAB_LOG -> refreshLog(force = true)
+            BottomNav.TAB_SETTINGS -> {
+                lastPermSig = ""
+                refreshPermsIfChanged()
+            }
         }
         refresh()
     }
@@ -733,6 +748,53 @@ class MainActivity : AppCompatActivity() {
             setPadding(0, 0, 0, Ui.dp(ctx, 14f))
         })
 
+        // ---------- 权限自检 ----------
+        val permCard = Ui.card(ctx, accent)
+        val permHead = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        permHead.addView(TextView(ctx).apply {
+            text = "权限自检"
+            textSize = 15f
+            setTextColor(Ui.TEXT)
+            typeface = Typeface.DEFAULT_BOLD
+            layoutParams = LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f
+            )
+        })
+        permSummary = TextView(ctx).apply {
+            text = "检查中…"
+            textSize = 11f
+            setTextColor(Ui.MUTED)
+            typeface = Typeface.MONOSPACE
+        }
+        permHead.addView(permSummary)
+        permCard.addView(permHead)
+
+        permCard.addView(Ui.body(ctx, "逐项核对本机是否真的拿到了所需权限。"))
+        permCard.addView(Ui.divider(ctx))
+
+        permBox = LinearLayout(ctx).apply { orientation = LinearLayout.VERTICAL }
+        permCard.addView(permBox)
+
+        // 按钮：申请缺失的运行时权限 / 跳系统设置
+        val permBtnRow = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = Ui.dp(ctx, 10f) }
+        }
+        permBtnRow.addView(Ui.primaryButton(ctx, "申请权限", accent) {
+            requestPermissionsThen { refreshPermsNow() }
+        })
+        permBtnRow.addView(Ui.ghostButton(ctx, "系统设置", accent) {
+            openAppSettings()
+        })
+        permCard.addView(permBtnRow)
+        root.addView(permCard)
+
         // 启动行为
         val autoCard = Ui.card(ctx)
         autoCard.addView(Ui.sectionLabel(ctx, "启动行为", Ui.MUTED))
@@ -825,6 +887,101 @@ class MainActivity : AppCompatActivity() {
         return pageScroll(root)
     }
 
+    /** 渲染权限清单。 */
+    private fun refreshPermsNow() {
+        val items = PermCheck.phone(this)
+        val box = permBox ?: return
+        box.removeAllViews()
+
+        val missing = PermCheck.missingCritical(items)
+        val soft = items.count { !it.ok && !it.critical }
+        permSummary?.text = when {
+            PermCheck.allOk(items) -> "全部通过"
+            missing > 0 -> "缺 $missing 项关键"
+            else -> "$soft 项建议调整"
+        }
+        permSummary?.setTextColor(
+            when {
+                PermCheck.allOk(items) -> Ui.OK
+                missing > 0 -> Ui.ERR
+                else -> Ui.WARN
+            }
+        )
+
+        for (it in items) {
+            box.addView(permRow(it))
+        }
+    }
+
+    private fun permRow(item: PermCheck.Item): LinearLayout {
+        val ctx = this
+        val row = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, Ui.dp(ctx, 7f), 0, Ui.dp(ctx, 7f))
+        }
+
+        val dotColor = when {
+            item.ok -> Ui.OK
+            item.critical -> Ui.ERR
+            else -> Ui.WARN
+        }
+        row.addView(View(ctx).apply {
+            background = android.graphics.drawable.GradientDrawable().apply {
+                shape = android.graphics.drawable.GradientDrawable.OVAL
+                setColor(dotColor)
+            }
+            layoutParams = LinearLayout.LayoutParams(
+                Ui.dp(ctx, 8f), Ui.dp(ctx, 8f)
+            ).apply { marginEnd = Ui.dp(ctx, 10f) }
+        })
+
+        val col = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        col.addView(TextView(ctx).apply {
+            text = item.title
+            textSize = 13f
+            setTextColor(if (item.ok) Ui.TEXT else (if (item.critical) Ui.ERR else Ui.WARN))
+        })
+        col.addView(TextView(ctx).apply {
+            text = item.detail
+            textSize = 10.5f
+            setTextColor(Ui.MUTED)
+        })
+        row.addView(col)
+
+        row.addView(TextView(ctx).apply {
+            text = if (item.ok) "✓" else "✗"
+            textSize = 15f
+            setTextColor(dotColor)
+            typeface = Typeface.MONOSPACE
+        })
+        return row
+    }
+
+    /** 只在状态变化时重建，避免每秒刷 View。 */
+    private fun refreshPermsIfChanged() {
+        if (permBox == null) return
+        val items = PermCheck.phone(this)
+        val sig = items.joinToString(",") { "${it.id}=${it.ok}" }
+        if (sig == lastPermSig) return
+        lastPermSig = sig
+        refreshPermsNow()
+    }
+
+    private fun openAppSettings() {
+        runCatching {
+            startActivity(
+                Intent(
+                    Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    Uri.parse("package:$packageName")
+                )
+            )
+        }
+    }
+
     private fun versionName(): String = runCatching {
         packageManager.getPackageInfo(packageName, 0).versionName ?: "?"
     }.getOrDefault("?")
@@ -858,6 +1015,7 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         running = LocationRelayService.isRunning
+        lastPermSig = ""
         refresh()
 
         if (autoStartPending && !userStopped && !LocationRelayService.isRunning) {
@@ -898,6 +1056,7 @@ class MainActivity : AppCompatActivity() {
         if (pages[BottomNav.TAB_TRANSFER] != null) refreshTransfer()
         if (pages[BottomNav.TAB_SAT] != null) refreshSat()
         if (pages[BottomNav.TAB_LOG] != null) refreshLog(force = false)
+        refreshPermsIfChanged()
 
         ui.postDelayed({ if (!isFinishing) refresh() }, 1000)
     }
@@ -1092,6 +1251,11 @@ class MainActivity : AppCompatActivity() {
     // ==================== 权限 ====================
 
     private fun requestPermissionsThen(action: () -> Unit) {
+        pendingAction = action
+        doRequestPermissions()
+    }
+
+    private fun doRequestPermissions() {
         val need = mutableListOf<String>()
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
             != PackageManager.PERMISSION_GRANTED
@@ -1120,7 +1284,11 @@ class MainActivity : AppCompatActivity() {
                 ActivityCompat.requestPermissions(
                     this, arrayOf(Manifest.permission.ACCESS_BACKGROUND_LOCATION), REQ_BG
                 )
-            } else action()
+            } else {
+                val a = pendingAction
+                pendingAction = null
+                a?.invoke() ?: refreshPermsNow()
+            }
         } else {
             ActivityCompat.requestPermissions(this, need.toTypedArray(), REQ_BASIC)
         }
@@ -1131,9 +1299,16 @@ class MainActivity : AppCompatActivity() {
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         when (requestCode) {
-            REQ_BASIC -> requestPermissionsThen { startRelay() }
-            REQ_BG -> startRelay()
+            REQ_BASIC -> doRequestPermissions()
+            REQ_BG -> {
+                val a = pendingAction
+                pendingAction = null
+                a?.invoke() ?: refreshPermsNow()
+            }
         }
+        // 结果回来后立刻刷新自检状态
+        lastPermSig = ""
+        refreshPermsIfChanged()
     }
 
     companion object {

@@ -3,8 +3,10 @@ package com.lobster.lanenav.box
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.view.Gravity
 import android.view.View
 import android.widget.LinearLayout
@@ -13,6 +15,7 @@ import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import com.lobster.lanenav.uikit.PermCheck
 import com.lobster.lanenav.uikit.Segmented
 import com.lobster.lanenav.uikit.Ui
 
@@ -45,6 +48,11 @@ class MainActivity : AppCompatActivity() {
     /** 有权限请求在途，期间不得启动前台服务 */
     private var permissionPending = false
     private lateinit var ipLabel: TextView
+
+    // ---------- 权限自检 ----------
+    private var permBox: LinearLayout? = null
+    private var permSummary: TextView? = null
+    private var lastPermSig = ""
 
     /** 刷新循环专用 Handler，便于统一取消，避免重复循环。 */
     private val ui = android.os.Handler(android.os.Looper.getMainLooper())
@@ -263,6 +271,85 @@ class MainActivity : AppCompatActivity() {
         })
         root.addView(btnRow)
 
+        // ---------- 权限自检 ----------
+        val permCard = Ui.card(ctx, accent)
+        val permHead = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        permHead.addView(TextView(ctx).apply {
+            text = "权限自检"
+            textSize = 15f
+            setTextColor(Ui.TEXT)
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            layoutParams = LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f
+            )
+        })
+        permSummary = TextView(ctx).apply {
+            text = "检查中…"
+            textSize = 11f
+            setTextColor(Ui.MUTED)
+            typeface = android.graphics.Typeface.MONOSPACE
+        }
+        permHead.addView(permSummary)
+        permCard.addView(permHead)
+
+        permCard.addView(
+            Ui.body(ctx, "逐项核对本机是否真的拿到了所需权限。模拟位置授权不在普通权限弹窗里，必须单独开启。")
+        )
+        permCard.addView(Ui.divider(ctx))
+
+        permBox = LinearLayout(ctx).apply { orientation = LinearLayout.VERTICAL }
+        permCard.addView(permBox)
+
+        val permBtnRow = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = Ui.dp(ctx, 10f) }
+        }
+        permBtnRow.addView(Ui.primaryButton(ctx, "申请权限", accent) {
+            requestLocationPermission()
+            ui.postDelayed({ lastPermSig = ""; refreshPerms() }, 1200)
+        })
+        permBtnRow.addView(Ui.ghostButton(ctx, "系统设置", accent) {
+            runCatching {
+                startActivity(
+                    Intent(
+                        Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        Uri.parse("package:" + packageName)
+                    )
+                )
+            }
+        })
+        permCard.addView(permBtnRow)
+
+        // 模拟位置授权拿不到时，给一键跳开发者选项的入口
+        permCard.addView(TextView(ctx).apply {
+            text = "打开「模拟位置信息应用」设置 →"
+            textSize = 11.5f
+            setTextColor(accent)
+            typeface = android.graphics.Typeface.MONOSPACE
+            setPadding(0, Ui.dp(ctx, 10f), 0, 0)
+            setOnClickListener {
+                val ok = runCatching {
+                    startActivity(
+                        Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS)
+                    )
+                }.isSuccess
+                if (!ok) {
+                    android.widget.Toast.makeText(
+                        ctx,
+                        "无法打开开发者选项，请用 adb appops 授权",
+                        android.widget.Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
+        })
+        root.addView(permCard)
+
         // ---------- 说明 ----------
         val helpCard = Ui.card(ctx)
         helpCard.addView(Ui.sectionLabel(ctx, "首次必做：授权模拟位置", Ui.WARN))
@@ -353,6 +440,90 @@ class MainActivity : AppCompatActivity() {
             "gnss" -> String.format("%.0f° GNSS", b)
             else -> "—"
         }
+    }
+
+    /** 渲染权限清单。 */
+    private fun refreshPerms() {
+        val items = PermCheck.box(this)
+        val box = permBox ?: return
+        box.removeAllViews()
+
+        val missing = PermCheck.missingCritical(items)
+        val soft = items.count { !it.ok && !it.critical }
+        permSummary?.text = when {
+            PermCheck.allOk(items) -> "全部通过"
+            missing > 0 -> "缺 $missing 项关键"
+            else -> "$soft 项建议调整"
+        }
+        permSummary?.setTextColor(
+            when {
+                PermCheck.allOk(items) -> Ui.OK
+                missing > 0 -> Ui.ERR
+                else -> Ui.WARN
+            }
+        )
+
+        for (it in items) box.addView(permRow(it))
+    }
+
+    private fun permRow(item: PermCheck.Item): LinearLayout {
+        val ctx = this
+        val row = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, Ui.dp(ctx, 7f), 0, Ui.dp(ctx, 7f))
+        }
+
+        val dotColor = when {
+            item.ok -> Ui.OK
+            item.critical -> Ui.ERR
+            else -> Ui.WARN
+        }
+        row.addView(View(ctx).apply {
+            background = android.graphics.drawable.GradientDrawable().apply {
+                shape = android.graphics.drawable.GradientDrawable.OVAL
+                setColor(dotColor)
+            }
+            layoutParams = LinearLayout.LayoutParams(
+                Ui.dp(ctx, 8f), Ui.dp(ctx, 8f)
+            ).apply { marginEnd = Ui.dp(ctx, 10f) }
+        })
+
+        val col = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        col.addView(TextView(ctx).apply {
+            text = item.title
+            textSize = 13f
+            setTextColor(
+                if (item.ok) Ui.TEXT else (if (item.critical) Ui.ERR else Ui.WARN)
+            )
+        })
+        col.addView(TextView(ctx).apply {
+            text = item.detail
+            textSize = 10.5f
+            setTextColor(Ui.MUTED)
+        })
+        row.addView(col)
+
+        row.addView(TextView(ctx).apply {
+            text = if (item.ok) "✓" else "✗"
+            textSize = 15f
+            setTextColor(dotColor)
+            typeface = android.graphics.Typeface.MONOSPACE
+        })
+        return row
+    }
+
+    /** 只在状态变化时重建。 */
+    private fun refreshPermsIfChanged() {
+        if (permBox == null) return
+        val items = PermCheck.box(this)
+        val sig = items.joinToString(",") { "${'$'}{it.id}=${'$'}{it.ok}" }
+        if (sig == lastPermSig) return
+        lastPermSig = sig
+        refreshPerms()
     }
 
     private fun metricCell(container: LinearLayout, label: String): TextView {
@@ -457,6 +628,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        lastPermSig = ""
         refresh()
         // 只有「仅 TCP」模式才硬性要求手机 IP；BLE 与双通道不填 IP 也能先跑起来，
         // TCP 部分会在服务内部进入 WAIT_CONFIG 等待，不影响 BLE 注入。
@@ -564,6 +736,9 @@ class MainActivity : AppCompatActivity() {
             warnText.text = warns.joinToString("\n") { "⚠ $it" }
             warnText.visibility = View.VISIBLE
         }
+
+        // 权限状态变化时才重建卡片，避免每秒刷 View
+        refreshPermsIfChanged()
 
         ui.postDelayed({ refresh() }, 1000)
     }
