@@ -91,11 +91,23 @@ class LocationRelayService : Service() {
     private val gnssCallback = object : GnssStatus.Callback() {
         override fun onSatelliteStatusChanged(status: GnssStatus) {
             var used = 0
+            val list = ArrayList<SatInfo>(status.satelliteCount)
             for (i in 0 until status.satelliteCount) {
-                if (status.usedInFix(i)) used++
+                val u = status.usedInFix(i)
+                if (u) used++
+                list += SatInfo(
+                    svid = status.getSvid(i),
+                    constellation = status.getConstellationType(i),
+                    cn0 = status.getCn0DbHz(i),
+                    azimuth = status.getAzimuthDegrees(i),
+                    elevation = status.getElevationDegrees(i),
+                    used = u
+                )
             }
             sats = used
             satsTotal = status.satelliteCount
+            // 界面用: 完整卫星列表(星座/方位/仰角/信噪比)
+            GnssStore.update(list)
         }
     }
 
@@ -104,6 +116,7 @@ class LocationRelayService : Service() {
     override fun onCreate() {
         super.onCreate()
         isRunning = true
+        LogStore.add("SVC", "服务启动")
         lm = getSystemService(Context.LOCATION_SERVICE) as LocationManager
 
         // 前台服务启动保护:
@@ -121,6 +134,7 @@ class LocationRelayService : Service() {
         } catch (e: Exception) {
             Log.e(TAG, "startForeground 失败: ${e.message}", e)
             isRunning = false
+            LogStore.add("ERR", "前台服务启动失败: ${e.message}")
             runCatching { stopSelf() }
             return
         }
@@ -186,6 +200,7 @@ class LocationRelayService : Service() {
 
     private fun startBle() {
         val ble = BleGattServer(this)
+        LogStore.add("BLE", "广播已启动，等待盒子连接")
         ble.onCommand = { text ->
             val pingTs = WireProtocol.parseTs(text, WireProtocol.CMD_PING)
             if (pingTs != null) {
@@ -203,6 +218,7 @@ class LocationRelayService : Service() {
             Log.i(TAG, "BLE 通道已启动")
         } else {
             bleError = ble.lastError ?: "BLE 启动失败"
+            LogStore.add("ERR", "BLE 启动失败: " + bleError)
             Log.e(TAG, "BLE 启动失败: $bleError")
         }
     }
@@ -266,6 +282,7 @@ class LocationRelayService : Service() {
         )
         current = pkt
         updateHeadingSummary(bearing, bsrc)
+        lastAccuracy = acc
         lastFixSummary = String.format(
             "%.6f,%.6f ±%.1fm %s %s", pkt.lat, pkt.lon, pkt.acc, pkt.fix.tag, headingTag()
         )
@@ -382,6 +399,7 @@ class LocationRelayService : Service() {
         runCatching { sock.keepAlive = true }
         val c = Conn(sock)
         conns += c
+        LogStore.add("TCP", "盒子已连接 " + (sock.inetAddress?.hostAddress ?: "?"))
         clientCount = conns.size
         updateNoti(clientCount)
         Log.i(TAG, "盒子已接入: ${sock.inetAddress?.hostAddress}")
@@ -468,6 +486,7 @@ class LocationRelayService : Service() {
 
     private fun removeClient(c: Conn, updateNoti: Boolean = true) {
         conns -= c
+        LogStore.add("TCP", "盒子断开，剩余 " + conns.size)
         runCatching { c.w?.close() }
         runCatching { c.sock.close() }
         c.w = null
@@ -553,5 +572,7 @@ class LocationRelayService : Service() {
         @Volatile var lastRtt: Long = 0
         /** 航向摘要（值 + 来源），供界面显示 */
         @Volatile var lastHeadingSummary: String = "无"
+        /** 最近一次定位精度（米），-1 = 无 */
+        @Volatile var lastAccuracy: Float = -1f
     }
 }

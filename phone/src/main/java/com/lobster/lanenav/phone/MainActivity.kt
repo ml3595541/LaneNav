@@ -1,14 +1,21 @@
 package com.lobster.lanenav.phone
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Typeface
 import android.os.Build
 import android.os.Bundle
 import android.view.Gravity
+import android.view.View
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -16,15 +23,17 @@ import com.lobster.lanenav.uikit.Segmented
 import com.lobster.lanenav.uikit.Ui
 
 /**
- * 手机端界面：深色科技风。
+ * 手机端界面：深色科技风，底部四标签。
  *
+ * 传输 / 卫星 / 日志 / 设置
  * 强调色 = 红（ACCENT_PHONE），与图标一致。
  */
 class MainActivity : AppCompatActivity() {
 
     private val accent get() = Ui.ACCENT_PHONE
 
-    private lateinit var statusDot: android.view.View
+    // ---------- 传输页 ----------
+    private lateinit var statusDot: View
     private lateinit var statusTitle: TextView
     private lateinit var statusSub: TextView
     private lateinit var metricIp: TextView
@@ -35,34 +44,123 @@ class MainActivity : AppCompatActivity() {
     private lateinit var metricHeading: TextView
     private lateinit var metricFix: TextView
     private lateinit var warnText: TextView
+
+    // ---------- 卫星页 ----------
+    private lateinit var satStateText: TextView       // 右上「尚未采集 / 已采集」
+    private lateinit var satUsed: TextView            // 可用 / 搜索
+    private lateinit var satAcc: TextView             // 精度
+    private lateinit var skyView: SkyView
+    private lateinit var satCellBeidou: TextView
+    private lateinit var satCellGps: TextView
+    private lateinit var satCellGlo: TextView
+    private lateinit var satCellGal: TextView
+    private lateinit var satHint: TextView
+    private lateinit var satDetailBox: LinearLayout
+    private var onlyUsed = false
+    private var lastSatSig = ""
+
+    // ---------- 日志页 ----------
+    private lateinit var logBody: TextView
+    private lateinit var logEmpty: TextView
+    private var lastLogVersion = -1
+
+    // ---------- 页面容器 ----------
+    private lateinit var content: FrameLayout
+    private lateinit var nav: BottomNav
+    private val pages = arrayOfNulls<View>(4)
+    private var tab = 0
+
     private var running = false
-
-    /** 是否允许「打开应用自动启动」。默认开启。 */
     private var autoStartOnOpen = true
-
-    /** 本次进界面尚未尝试过自动启动（防止在 onResume 里反复触发） */
     private var autoStartPending = false
-
-    /** 用户主动点过「停止」，本次进界面内不再自动重启 */
     private var userStopped = false
 
-    /** 刷新循环专用 Handler，便于统一取消，避免重复循环。 */
     private val ui = android.os.Handler(android.os.Looper.getMainLooper())
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         supportActionBar?.hide()
 
-        val ctx = this
-        val pad = Ui.dp(ctx, 16f)
+        val sp = getSharedPreferences("lanenav", MODE_PRIVATE)
+        autoStartOnOpen = sp.getBoolean("auto_start_on_open", true)
+        autoStartPending = autoStartOnOpen
 
-        val root = LinearLayout(ctx).apply {
+        content = FrameLayout(this).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
+            )
+        }
+        nav = BottomNav(this, accent) { idx -> showTab(idx) }
+
+        setContentView(LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Ui.BG)
+            addView(content)
+            // 顶部细分隔线
+            addView(View(this@MainActivity).apply {
+                setBackgroundColor(Ui.BORDER)
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, 1
+                )
+            })
+            addView(
+                nav,
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                )
+            )
+        })
+
+        showTab(BottomNav.TAB_TRANSFER)
+    }
+
+    // ==================== 页面切换 ====================
+
+    private fun showTab(i: Int) {
+        tab = i
+        nav.select(i)
+        content.removeAllViews()
+        val page = pages[i] ?: when (i) {
+            BottomNav.TAB_SAT -> buildSatPage()
+            BottomNav.TAB_LOG -> buildLogPage()
+            BottomNav.TAB_SETTINGS -> buildSettingsPage()
+            else -> buildTransferPage()
+        }.also { pages[i] = it }
+        content.addView(page)
+
+        // 切页时立即刷新一次，避免看到过期数据
+        when (i) {
+            BottomNav.TAB_SAT -> refreshSat()
+            BottomNav.TAB_LOG -> refreshLog(force = true)
+        }
+        refresh()
+    }
+
+    private fun pageScroll(root: LinearLayout): ScrollView = ScrollView(this).apply {
+        setBackgroundColor(Ui.BG)
+        layoutParams = FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT,
+            FrameLayout.LayoutParams.MATCH_PARENT
+        )
+        addView(root)
+    }
+
+    private fun pageRoot(): LinearLayout {
+        val pad = Ui.dp(this, 16f)
+        return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(pad, pad, pad, pad)
             setBackgroundColor(Ui.BG)
         }
+    }
 
-        // ---------- 顶栏 ----------
+    // ==================== 传输页 ====================
+
+    private fun buildTransferPage(): View {
+        val ctx = this
+        val root = pageRoot()
+
         val header = LinearLayout(ctx).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -72,13 +170,10 @@ class MainActivity : AppCompatActivity() {
             ).apply { bottomMargin = Ui.dp(ctx, 16f) }
         }
         header.addView(TextView(ctx).apply {
-            text = "LANENAV"
-            textSize = 19f
+            text = "传输"
+            textSize = 24f
             setTextColor(Ui.TEXT)
-            letterSpacing = 0.12f
-            typeface = android.graphics.Typeface.create(
-                android.graphics.Typeface.MONOSPACE, android.graphics.Typeface.BOLD
-            )
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         })
         header.addView(TextView(ctx).apply {
@@ -86,16 +181,7 @@ class MainActivity : AppCompatActivity() {
             textSize = 10f
             setTextColor(accent)
             letterSpacing = 0.18f
-            typeface = android.graphics.Typeface.create(
-                android.graphics.Typeface.MONOSPACE, android.graphics.Typeface.BOLD
-            )
-            background = android.graphics.drawable.GradientDrawable().apply {
-                shape = android.graphics.drawable.GradientDrawable.RECTANGLE
-                cornerRadius = Ui.dp(ctx, 6f).toFloat()
-                setColor(Ui.alpha(accent, 0.14f))
-                setStroke(1, Ui.alpha(accent, 0.5f))
-            }
-            setPadding(Ui.dp(ctx, 8f), Ui.dp(ctx, 4f), Ui.dp(ctx, 8f), Ui.dp(ctx, 4f))
+            typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
         })
         root.addView(header)
 
@@ -121,13 +207,13 @@ class MainActivity : AppCompatActivity() {
             text = "未启动"
             textSize = 17f
             setTextColor(Ui.TEXT)
-            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            typeface = Typeface.DEFAULT_BOLD
         }
         statusSub = TextView(ctx).apply {
             text = "点击下方按钮开始转发"
             textSize = 11.5f
             setTextColor(Ui.MUTED)
-            typeface = android.graphics.Typeface.MONOSPACE
+            typeface = Typeface.MONOSPACE
         }
         statusCol.addView(statusTitle)
         statusCol.addView(statusSub)
@@ -136,7 +222,6 @@ class MainActivity : AppCompatActivity() {
 
         statusCard.addView(Ui.divider(ctx))
 
-        // 指标网格（2x2）
         val grid1 = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL }
         metricIp = metricCell(grid1, "本机 IP")
         metricPort = metricCell(grid1, "监听端口")
@@ -169,19 +254,18 @@ class MainActivity : AppCompatActivity() {
             text = "最近定位：—"
             textSize = 11.5f
             setTextColor(Ui.MUTED)
-            typeface = android.graphics.Typeface.MONOSPACE
+            typeface = Typeface.MONOSPACE
         }
         statusCard.addView(metricFix)
 
         warnText = TextView(ctx).apply {
             textSize = 11.5f
             setTextColor(Ui.ERR)
-            typeface = android.graphics.Typeface.MONOSPACE
-            visibility = android.view.View.GONE
+            typeface = Typeface.MONOSPACE
+            visibility = View.GONE
             setPadding(0, Ui.dp(ctx, 8f), 0, 0)
         }
         statusCard.addView(warnText)
-
         root.addView(statusCard)
 
         // ---------- 传输通道 ----------
@@ -189,47 +273,475 @@ class MainActivity : AppCompatActivity() {
         chanCard.addView(Ui.sectionLabel(ctx, "传输通道", Ui.MUTED))
 
         val sp = getSharedPreferences("lanenav", MODE_PRIVATE)
-        autoStartOnOpen = sp.getBoolean("auto_start_on_open", true)
-        autoStartPending = autoStartOnOpen
         val curChannel = sp.getString("channel", "both") ?: "both"
         val chanIndex = when (curChannel) {
             "ble" -> 0
             "tcp" -> 1
             else -> 2
         }
-        val seg = Segmented(
-            ctx,
-            listOf("蓝牙 BLE", "WiFi TCP", "双通道"),
-            accent,
-            chanIndex
-        ) { idx ->
+        val seg = Segmented(ctx, listOf("蓝牙 BLE", "WiFi TCP", "双通道"), accent, chanIndex) { idx ->
             val ch = when (idx) {
                 0 -> "ble"
                 1 -> "tcp"
                 else -> "both"
             }
             sp.edit().putString("channel", ch).apply()
+            LogStore.add("CFG", "通道切换为 $ch")
             if (running) {
                 stopRelay()
                 ui.postDelayed({ startRelay() }, 500)
             }
         }
         chanCard.addView(seg)
-        chanCard.addView(
-            Ui.body(ctx, "切换后自动重启服务。BLE 不需要开热点，功耗更低。")
-        )
+        chanCard.addView(Ui.body(ctx, "切换后自动重启服务。BLE 不需要开热点，功耗更低。"))
         root.addView(chanCard)
 
-        // ---------- 自动启动 ----------
+        // ---------- 操作按钮 ----------
+        val btnRow = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = Ui.dp(ctx, 4f)
+                bottomMargin = Ui.dp(ctx, 16f)
+            }
+        }
+        btnRow.addView(Ui.primaryButton(ctx, "启动转发", accent) {
+            LogStore.add("UI", "点击启动转发")
+            requestPermissionsThen { startRelay() }
+        })
+        btnRow.addView(Ui.ghostButton(ctx, "停止", accent) {
+            LogStore.add("UI", "点击停止")
+            stopRelay()
+        })
+        root.addView(btnRow)
+
+        root.addView(Ui.spacer(ctx, 8f))
+        return pageScroll(root)
+    }
+
+    // ==================== 卫星页 ====================
+
+    private fun buildSatPage(): View {
+        val ctx = this
+        val root = pageRoot()
+
+        // 标题行
+        val header = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        header.addView(LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            addView(TextView(ctx).apply {
+                text = "卫星状态"
+                textSize = 24f
+                setTextColor(Ui.TEXT)
+                typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            })
+            addView(TextView(ctx).apply {
+                text = "GNSS / 实时信号"
+                textSize = 12.5f
+                setTextColor(Ui.MUTED)
+                typeface = Typeface.MONOSPACE
+            })
+        })
+
+        // 右上角数据块
+        val rightCard = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(Ui.dp(ctx, 14f), Ui.dp(ctx, 8f), Ui.dp(ctx, 14f), Ui.dp(ctx, 8f))
+            background = android.graphics.drawable.GradientDrawable().apply {
+                cornerRadius = Ui.dp(ctx, 12f).toFloat()
+                setColor(Ui.CARD)
+                setStroke(1, Ui.BORDER)
+            }
+        }
+        satStateText = TextView(ctx).apply {
+            text = "尚未采集"
+            textSize = 11f
+            setTextColor(Ui.MUTED)
+            gravity = Gravity.END
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = Ui.dp(ctx, 4f) }
+        }
+        rightCard.addView(satStateText)
+
+        val usedRow = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        satUsed = TextView(ctx).apply {
+            text = "— / —"
+            textSize = 20f
+            setTextColor(Ui.TEXT)
+            typeface = Typeface.MONOSPACE
+        }
+        usedRow.addView(satUsed)
+        rightCard.addView(usedRow)
+
+        rightCard.addView(TextView(ctx).apply {
+            text = "可用 / 搜索   本机 GNSS"
+            textSize = 9.5f
+            setTextColor(Ui.DIM)
+            typeface = Typeface.MONOSPACE
+        })
+        header.addView(rightCard)
+        root.addView(header)
+
+        // 精度行
+        satAcc = TextView(ctx).apply {
+            text = "精度 —"
+            textSize = 13f
+            setTextColor(Ui.OK)
+            typeface = Typeface.MONOSPACE
+            setPadding(0, Ui.dp(ctx, 12f), 0, Ui.dp(ctx, 8f))
+        }
+        root.addView(satAcc)
+
+        // 图例
+        val legend = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = Ui.dp(ctx, 8f) }
+        }
+        listOf(
+            "北斗" to 0xFFFFB020.toInt(),
+            "GPS" to 0xFF38A7D5.toInt(),
+            "GLONASS" to 0xFFA78BFA.toInt(),
+            "Galileo" to 0xFF2ED573.toInt()
+        ).forEach { (name, color) ->
+            legend.addView(LinearLayout(ctx).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                layoutParams = LinearLayout.LayoutParams(
+                    0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f
+                )
+                addView(View(ctx).apply {
+                    background = android.graphics.drawable.GradientDrawable().apply {
+                        shape = android.graphics.drawable.GradientDrawable.OVAL
+                        setColor(color)
+                    }
+                    layoutParams = LinearLayout.LayoutParams(
+                        Ui.dp(ctx, 7f), Ui.dp(ctx, 7f)
+                    ).apply { marginEnd = Ui.dp(ctx, 5f) }
+                })
+                addView(TextView(ctx).apply {
+                    text = name
+                    textSize = 10.5f
+                    setTextColor(Ui.MUTED)
+                })
+            })
+        }
+        root.addView(legend)
+
+        // 球体 / 天空图卡片
+        val skyCard = Ui.card(ctx).apply {
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).also { it.bottomMargin = Ui.dp(ctx, 10f) }
+        }
+        skyView = SkyView(ctx).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            )
+        }
+        skyCard.addView(skyView)
+
+        val modeSeg = Segmented(ctx, listOf("🌍  地球", "◎  天空图"), accent, 0) { idx ->
+            skyView.mode = if (idx == 0) SkyView.Mode.GLOBE else SkyView.Mode.SKY
+        }
+        modeSeg.layoutParams = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = Ui.dp(ctx, 4f) }
+        skyCard.addView(modeSeg)
+
+        skyCard.addView(TextView(ctx).apply {
+            text = if (true) "地球示意 · 北朝上 · 实测方位/仰角" else ""
+            textSize = 10.5f
+            setTextColor(Ui.DIM)
+            typeface = Typeface.MONOSPACE
+        })
+        root.addView(skyCard)
+
+        // 四星座 2x2
+        val row1 = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL }
+        satCellBeidou = satCell(row1, "北斗", 0xFFFFB020.toInt())
+        satCellGps = satCell(row1, "GPS", 0xFF38A7D5.toInt())
+        root.addView(row1)
+
+        val row2 = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = Ui.dp(ctx, 8f) }
+        }
+        satCellGlo = satCell(row2, "GLO", 0xFFA78BFA.toInt())
+        satCellGal = satCell(row2, "GAL", 0xFF2ED573.toInt())
+        root.addView(row2)
+
+        satHint = TextView(ctx).apply {
+            text = "共享尚未启动，启动「共享 GPS」后显示本机卫星。"
+            textSize = 11f
+            setTextColor(Ui.MUTED)
+            setPadding(0, Ui.dp(ctx, 12f), 0, Ui.dp(ctx, 4f))
+        }
+        root.addView(satHint)
+
+        // 卫星明细
+        val detailCard = Ui.card(ctx)
+        val detailHead = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        detailHead.addView(TextView(ctx).apply {
+            text = "卫星明细"
+            textSize = 16f
+            setTextColor(Ui.TEXT)
+            typeface = Typeface.DEFAULT_BOLD
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        })
+        detailHead.addView(TextView(ctx).apply {
+            text = "信号强度 ↓"
+            textSize = 11f
+            setTextColor(Ui.MUTED)
+            typeface = Typeface.MONOSPACE
+        })
+        detailCard.addView(detailHead)
+
+        val onlyUsedRow = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, Ui.dp(ctx, 8f), 0, Ui.dp(ctx, 4f))
+        }
+        onlyUsedRow.addView(TextView(ctx).apply {
+            text = "仅看可用"
+            textSize = 12f
+            setTextColor(Ui.MUTED)
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        })
+        val sw = android.widget.Switch(ctx).apply {
+            isChecked = onlyUsed
+            setOnCheckedChangeListener { _, checked ->
+                onlyUsed = checked
+                lastSatSig = ""
+                refreshSat()
+            }
+        }
+        onlyUsedRow.addView(sw)
+        detailCard.addView(onlyUsedRow)
+
+        detailCard.addView(TextView(ctx).apply {
+            text = "等待报告 · 实心参与定位，空心未参与"
+            textSize = 10f
+            setTextColor(Ui.DIM)
+            setPadding(0, 0, 0, Ui.dp(ctx, 6f))
+        })
+
+        satDetailBox = LinearLayout(ctx).apply { orientation = LinearLayout.VERTICAL }
+        detailCard.addView(satDetailBox)
+        root.addView(detailCard)
+
+        root.addView(Ui.spacer(ctx, 16f))
+        return pageScroll(root)
+    }
+
+    /** 星座四宫格单元。 */
+    private fun satCell(container: LinearLayout, name: String, color: Int): TextView {
+        val cell = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                .apply { marginEnd = Ui.dp(this@MainActivity, 8f) }
+            setPadding(Ui.dp(this@MainActivity, 12f), Ui.dp(this@MainActivity, 10f),
+                Ui.dp(this@MainActivity, 12f), Ui.dp(this@MainActivity, 10f))
+            background = android.graphics.drawable.GradientDrawable().apply {
+                cornerRadius = Ui.dp(this@MainActivity, 12f).toFloat()
+                setColor(Ui.CARD)
+                setStroke(1, Ui.BORDER)
+            }
+        }
+        val head = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        head.addView(View(this).apply {
+            background = android.graphics.drawable.GradientDrawable().apply {
+                shape = android.graphics.drawable.GradientDrawable.OVAL
+                setColor(color)
+            }
+            layoutParams = LinearLayout.LayoutParams(
+                Ui.dp(this@MainActivity, 8f), Ui.dp(this@MainActivity, 8f)
+            ).apply { marginEnd = Ui.dp(this@MainActivity, 6f) }
+        })
+        head.addView(TextView(this).apply {
+            text = name
+            textSize = 12f
+            setTextColor(color)
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        })
+        cell.addView(head)
+
+        val value = TextView(this).apply {
+            text = "— / —"
+            textSize = 17f
+            setTextColor(Ui.TEXT)
+            typeface = Typeface.MONOSPACE
+            setPadding(0, Ui.dp(this@MainActivity, 4f), 0, 0)
+        }
+        cell.addView(value)
+
+        cell.addView(TextView(this).apply {
+            text = "可用 / 搜索"
+            textSize = 9.5f
+            setTextColor(Ui.DIM)
+            typeface = Typeface.MONOSPACE
+        })
+        container.addView(cell)
+        return value
+    }
+
+    // ==================== 日志页 ====================
+
+    private fun buildLogPage(): View {
+        val ctx = this
+        val root = pageRoot()
+
+        root.addView(TextView(ctx).apply {
+            text = "运行日志"
+            textSize = 24f
+            setTextColor(Ui.TEXT)
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        })
+        root.addView(TextView(ctx).apply {
+            text = "连接、定位与错误记录"
+            textSize = 12.5f
+            setTextColor(Ui.MUTED)
+            typeface = Typeface.MONOSPACE
+            setPadding(0, 0, 0, Ui.dp(ctx, 14f))
+        })
+
+        val btnRow = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = Ui.dp(ctx, 12f) }
+        }
+        btnRow.addView(textButton("复制日志", accent) {
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            cm.setPrimaryClip(ClipData.newPlainText("lanenav-log", LogStore.text()))
+            LogStore.add("UI", "日志已复制 (${LogStore.size()} 条)")
+            Toast.makeText(this, "已复制 ${LogStore.size()} 条日志", Toast.LENGTH_SHORT).show()
+            refreshLog(force = true)
+        })
+        btnRow.addView(textButton("分享日志", accent) {
+            val text = LogStore.text()
+            if (text.isBlank()) {
+                Toast.makeText(this, "暂无日志可分享", Toast.LENGTH_SHORT).show()
+            } else {
+                runCatching {
+                    startActivity(
+                        Intent.createChooser(
+                            Intent(Intent.ACTION_SEND).apply {
+                                type = "text/plain"
+                                putExtra(Intent.EXTRA_TEXT, text)
+                                putExtra(Intent.EXTRA_SUBJECT, "LaneNav 运行日志")
+                            },
+                            "分享日志"
+                        )
+                    )
+                }
+            }
+        })
+        root.addView(btnRow)
+
+        logEmpty = TextView(ctx).apply {
+            text = "暂无日志。启动传输后可在这里查看状态。"
+            textSize = 12.5f
+            setTextColor(Ui.MUTED)
+            gravity = Gravity.CENTER
+            setPadding(Ui.dp(ctx, 16f), Ui.dp(ctx, 26f), Ui.dp(ctx, 16f), Ui.dp(ctx, 26f))
+            background = android.graphics.drawable.GradientDrawable().apply {
+                cornerRadius = Ui.dp(ctx, 14f).toFloat()
+                setColor(Ui.CARD)
+                setStroke(1, Ui.BORDER)
+            }
+        }
+        root.addView(logEmpty)
+
+        val logCard = Ui.card(ctx).apply { visibility = View.GONE }
+        logBody = TextView(ctx).apply {
+            textSize = 11.5f
+            setTextColor(Ui.TEXT)
+            typeface = Typeface.MONOSPACE
+            setTextIsSelectable(true)
+            setLineSpacing(Ui.dp(ctx, 3f).toFloat(), 1f)
+        }
+        logCard.addView(logBody)
+        root.addView(logCard)
+        logCard.tag = "logCard"
+
+        root.addView(TextView(ctx).apply {
+            text = "日志只保留在本次应用进程中。分享前请检查其中的设备地址和位置信息。"
+            textSize = 10.5f
+            setTextColor(Ui.DIM)
+            setPadding(0, Ui.dp(ctx, 14f), 0, 0)
+        })
+
+        root.addView(Ui.spacer(ctx, 16f))
+        return pageScroll(root)
+    }
+
+    private fun textButton(label: String, color: Int, onClick: () -> Unit): TextView =
+        TextView(this).apply {
+            text = label
+            textSize = 13.5f
+            setTextColor(color)
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            gravity = Gravity.CENTER
+            setPadding(0, Ui.dp(this@MainActivity, 10f), Ui.dp(this@MainActivity, 16f),
+                Ui.dp(this@MainActivity, 10f))
+            setOnClickListener { onClick() }
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { marginEnd = Ui.dp(this@MainActivity, 4f) }
+        }
+
+    // ==================== 设置页 ====================
+
+    private fun buildSettingsPage(): View {
+        val ctx = this
+        val root = pageRoot()
+
+        root.addView(TextView(ctx).apply {
+            text = "设置"
+            textSize = 24f
+            setTextColor(Ui.TEXT)
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            setPadding(0, 0, 0, Ui.dp(ctx, 14f))
+        })
+
+        // 启动行为
         val autoCard = Ui.card(ctx)
         autoCard.addView(Ui.sectionLabel(ctx, "启动行为", Ui.MUTED))
-        val autoBox = Ui.checkbox(
-            ctx, "打开应用自动启动转发", autoStartOnOpen, accent
-        )
+        val autoBox = Ui.checkbox(ctx, "打开应用自动启动转发", autoStartOnOpen, accent)
         autoBox.setOnCheckedChangeListener { _, checked ->
             autoStartOnOpen = checked
             getSharedPreferences("lanenav", MODE_PRIVATE).edit()
                 .putBoolean("auto_start_on_open", checked).apply()
+            LogStore.add("CFG", if (checked) "已开启自动启动" else "已关闭自动启动")
         }
         autoCard.addView(autoBox)
         autoCard.addView(
@@ -241,21 +753,7 @@ class MainActivity : AppCompatActivity() {
         )
         root.addView(autoCard)
 
-        // ---------- 操作按钮 ----------
-        val btnRow = LinearLayout(ctx).apply {
-            orientation = LinearLayout.HORIZONTAL
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = Ui.dp(ctx, 16f) }
-        }
-        btnRow.addView(Ui.primaryButton(ctx, "启动转发", accent) {
-            requestPermissionsThen { startRelay() }
-        })
-        btnRow.addView(Ui.ghostButton(ctx, "停止", accent) { stopRelay() })
-        root.addView(btnRow)
-
-        // ---------- 必设说明 ----------
+        // 必设清单
         val helpCard = Ui.card(ctx)
         helpCard.addView(Ui.sectionLabel(ctx, "手机必设，否则会出现断流", Ui.WARN))
         helpCard.addView(
@@ -269,7 +767,6 @@ class MainActivity : AppCompatActivity() {
                 Ui.TEXT
             )
         )
-
         helpCard.addView(Ui.divider(ctx))
         helpCard.addView(Ui.sectionLabel(ctx, "使用", Ui.MUTED))
         helpCard.addView(
@@ -280,54 +777,57 @@ class MainActivity : AppCompatActivity() {
                     "· 双通道：两者同时启用，互为备份"
             )
         )
-
-        helpCard.addView(Ui.divider(ctx))
-        helpCard.addView(
-            Ui.mono(
-                ctx,
-                "机型 ${Build.MODEL} · Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})",
-                11f,
-                Ui.DIM
-            )
-        )
         root.addView(helpCard)
 
-        // ---------- 作者联系方式 ----------
+        // 关于
+        val aboutCard = Ui.card(ctx)
+        aboutCard.addView(Ui.sectionLabel(ctx, "关于", Ui.MUTED))
+        aboutCard.addView(Ui.row(ctx, "版本", versionName()))
+        aboutCard.addView(Ui.row(ctx, "机型", Build.MODEL))
+        aboutCard.addView(Ui.row(ctx, "系统", "Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})"))
+        aboutCard.addView(Ui.divider(ctx))
+        aboutCard.addView(Ui.row(ctx, "日志条数", "${LogStore.size()} / 500"))
+        val clearBtn = Ui.ghostButton(ctx, "清空日志", accent) {
+            LogStore.clear()
+            lastLogVersion = -1
+            Toast.makeText(this, "日志已清空", Toast.LENGTH_SHORT).show()
+        }
+        clearBtn.layoutParams = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, Ui.dp(ctx, 42f)
+        )
+        aboutCard.addView(clearBtn)
+        root.addView(aboutCard)
+
+        // 作者
         val footer = LinearLayout(ctx).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = Ui.dp(ctx, 2f) }
+            ).apply { topMargin = Ui.dp(ctx, 4f) }
         }
         footer.addView(TextView(ctx).apply {
             text = "作者微信：SnownyC"
             textSize = 12f
             setTextColor(Ui.DIM)
-            typeface = android.graphics.Typeface.MONOSPACE
+            typeface = Typeface.MONOSPACE
             setPadding(Ui.dp(ctx, 10f), Ui.dp(ctx, 8f), Ui.dp(ctx, 10f), Ui.dp(ctx, 8f))
-            // 点一下复制，方便直接去微信搜索
             setOnClickListener {
-                val cm = getSystemService(android.content.Context.CLIPBOARD_SERVICE)
-                    as android.content.ClipboardManager
-                cm.setPrimaryClip(
-                    android.content.ClipData.newPlainText("wechat", "SnownyC")
-                )
-                android.widget.Toast.makeText(
-                    ctx, "微信号已复制", android.widget.Toast.LENGTH_SHORT
-                ).show()
+                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                cm.setPrimaryClip(ClipData.newPlainText("wechat", "SnownyC"))
+                Toast.makeText(this@MainActivity, "微信号已复制", Toast.LENGTH_SHORT).show()
             }
         })
         root.addView(footer)
 
-        root.addView(Ui.spacer(ctx, 24f))
-
-        setContentView(ScrollView(ctx).apply {
-            setBackgroundColor(Ui.BG)
-            addView(root)
-        })
+        root.addView(Ui.spacer(ctx, 20f))
+        return pageScroll(root)
     }
+
+    private fun versionName(): String = runCatching {
+        packageManager.getPackageInfo(packageName, 0).versionName ?: "?"
+    }.getOrDefault("?")
 
     /** 指标格：上方小标签，下方大数字。 */
     private fun metricCell(container: LinearLayout, label: String): TextView {
@@ -340,26 +840,26 @@ class MainActivity : AppCompatActivity() {
             textSize = 10f
             setTextColor(Ui.DIM)
             letterSpacing = 0.1f
-            typeface = android.graphics.Typeface.MONOSPACE
+            typeface = Typeface.MONOSPACE
         })
         val value = TextView(this).apply {
             text = "—"
             textSize = 15f
             setTextColor(Ui.TEXT)
-            typeface = android.graphics.Typeface.MONOSPACE
+            typeface = Typeface.MONOSPACE
         }
         cell.addView(value)
         container.addView(cell)
         return value
     }
 
+    // ==================== 生命周期 ====================
+
     override fun onResume() {
         super.onResume()
         running = LocationRelayService.isRunning
         refresh()
 
-        // 开启「打开应用自动启动」时，进界面自动启动一次。
-        // autoStartPending 保证只触发一次；userStopped 保证手动停止后不会被拉起。
         if (autoStartPending && !userStopped && !LocationRelayService.isRunning) {
             autoStartPending = false
             requestPermissionsThen { startRelay() }
@@ -368,6 +868,11 @@ class MainActivity : AppCompatActivity() {
 
     override fun onPause() {
         super.onPause()
+        ui.removeCallbacksAndMessages(null)
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
         ui.removeCallbacksAndMessages(null)
     }
 
@@ -387,7 +892,17 @@ class MainActivity : AppCompatActivity() {
         refresh()
     }
 
+    // ==================== 刷新 ====================
+
     private fun refresh() {
+        if (pages[BottomNav.TAB_TRANSFER] != null) refreshTransfer()
+        if (pages[BottomNav.TAB_SAT] != null) refreshSat()
+        if (pages[BottomNav.TAB_LOG] != null) refreshLog(force = false)
+
+        ui.postDelayed({ if (!isFinishing) refresh() }, 1000)
+    }
+
+    private fun refreshTransfer() {
         if (!running) {
             statusDot.background = android.graphics.drawable.GradientDrawable().apply {
                 shape = android.graphics.drawable.GradientDrawable.OVAL
@@ -400,8 +915,10 @@ class MainActivity : AppCompatActivity() {
             metricPort.text = "19800"
             metricTcp.text = "0"
             metricBle.text = "0"
+            metricRtt.text = "—"
+            metricHeading.text = "—"
             metricFix.text = "最近定位：—"
-            warnText.visibility = android.view.View.GONE
+            warnText.visibility = View.GONE
             return
         }
 
@@ -415,15 +932,17 @@ class MainActivity : AppCompatActivity() {
         }
         statusTitle.text = if (active) "转发中" else "等待连接"
         statusTitle.setTextColor(if (active) Ui.OK else Ui.TEXT)
-        statusSub.text = buildString {
-            append(if (tcp > 0 && ble > 0) "双通道在线" else if (ble > 0) "BLE 在线" else if (tcp > 0) "TCP 在线" else "服务运行中")
+        statusSub.text = when {
+            tcp > 0 && ble > 0 -> "双通道在线"
+            ble > 0 -> "BLE 在线"
+            tcp > 0 -> "TCP 在线"
+            else -> "服务运行中"
         }
 
         metricIp.text = NetUtils.localIpv4()
         metricPort.text = "19800"
         metricTcp.text = tcp.toString()
         metricBle.text = ble.toString()
-        // 延时由盒子回传（ping/pong 单时钟测量），自己算不出来
         val rtt = LocationRelayService.lastRtt
         metricRtt.text = if (rtt > 0) "${rtt}ms" else "—"
         metricHeading.text = LocationRelayService.lastHeadingSummary
@@ -432,13 +951,145 @@ class MainActivity : AppCompatActivity() {
         val err = LocationRelayService.bleError
         if (err != null) {
             warnText.text = "⚠ BLE：$err"
-            warnText.visibility = android.view.View.VISIBLE
+            warnText.visibility = View.VISIBLE
         } else {
-            warnText.visibility = android.view.View.GONE
+            warnText.visibility = View.GONE
+        }
+    }
+
+    private fun refreshSat() {
+        val fresh = GnssStore.fresh()
+        val sats = GnssStore.sats
+        val used = GnssStore.usedTotal()
+        val vis = GnssStore.visibleTotal()
+
+        satStateText.text = if (fresh) "已采集" else "尚未采集"
+        satStateText.setTextColor(if (fresh) Ui.OK else Ui.MUTED)
+        satUsed.text = if (fresh) "$used / $vis" else "— / —"
+
+        val acc = LocationRelayService.lastAccuracy
+        satAcc.text = if (running && acc > 0) {
+            "精度 ${String.format("%.1f", acc)} m"
+        } else if (!running) {
+            "精度 —    共享尚未启动"
+        } else {
+            "精度 —    等待定位"
+        }
+        satAcc.setTextColor(if (running && acc > 0) Ui.OK else Ui.MUTED)
+
+        val bd = GnssStore.countOf("北斗")
+        val gp = GnssStore.countOf("GPS")
+        val gl = GnssStore.countOf("GLO")
+        val ga = GnssStore.countOf("GAL")
+        satCellBeidou.text = if (fresh) "${bd.first} / ${bd.second}" else "— / —"
+        satCellGps.text = if (fresh) "${gp.first} / ${gp.second}" else "— / —"
+        satCellGlo.text = if (fresh) "${gl.first} / ${gl.second}" else "— / —"
+        satCellGal.text = if (fresh) "${ga.first} / ${ga.second}" else "— / —"
+
+        satHint.text = when {
+            !running -> "共享尚未启动，启动「共享 GPS」后显示本机卫星。"
+            !fresh -> "已启动，正在搜索卫星…"
+            else -> "卫星数据实时更新中（${vis} 颗可见，${used} 颗参与定位）。"
         }
 
-        ui.postDelayed({ if (running) refresh() }, 1000)
+        skyView.emptyHint = if (!running) "启动共享后采集卫星" else "搜索卫星中…"
+        skyView.invalidate()
+
+        // 明细列表：数据变了才重建，避免每秒抖动
+        val sig = if (!fresh) "none" else sats.sortedByDescending { it.cn0 }
+            .joinToString("|") { "${it.label},${it.cn0},${it.used}" } + "|u=$onlyUsed"
+        if (sig != lastSatSig) {
+            lastSatSig = sig
+            rebuildSatDetail()
+        }
     }
+
+    private fun rebuildSatDetail() {
+        satDetailBox.removeAllViews()
+        val fresh = GnssStore.fresh()
+        if (!fresh) {
+            satDetailBox.addView(Ui.body(this, "暂无卫星数据", Ui.DIM))
+            return
+        }
+        var list = GnssStore.sats.sortedByDescending { it.cn0 }
+        if (onlyUsed) list = list.filter { it.used }
+        if (list.isEmpty()) {
+            satDetailBox.addView(Ui.body(this, "没有符合条件的卫星", Ui.DIM))
+            return
+        }
+
+        for (s in list.take(40)) {
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, Ui.dp(this@MainActivity, 5f), 0, Ui.dp(this@MainActivity, 5f))
+            }
+            row.addView(TextView(this).apply {
+                text = s.label
+                textSize = 12f
+                setTextColor(if (s.used) Ui.TEXT else Ui.MUTED)
+                typeface = Typeface.MONOSPACE
+                layoutParams = LinearLayout.LayoutParams(
+                    Ui.dp(this@MainActivity, 52f), LinearLayout.LayoutParams.WRAP_CONTENT
+                )
+            })
+            row.addView(TextView(this).apply {
+                text = String.format("%.0f°", s.elevation)
+                textSize = 11f
+                setTextColor(Ui.DIM)
+                typeface = Typeface.MONOSPACE
+                layoutParams = LinearLayout.LayoutParams(
+                    Ui.dp(this@MainActivity, 42f), LinearLayout.LayoutParams.WRAP_CONTENT
+                )
+            })
+
+            // 信号条
+            val bar = View(this).apply {
+                background = android.graphics.drawable.GradientDrawable().apply {
+                    cornerRadius = Ui.dp(this@MainActivity, 3f).toFloat()
+                    setColor(
+                        if (s.used) 0xFF38A7D5.toInt() else Ui.DIM
+                    )
+                }
+            }
+            val ratio = (s.cn0 / 50f).coerceIn(0.05f, 1f)
+            row.addView(bar, LinearLayout.LayoutParams(0, Ui.dp(this@MainActivity, 6f), ratio))
+            row.addView(View(this).apply {
+                layoutParams = LinearLayout.LayoutParams(0, 1, 1f - ratio)
+            })
+
+            row.addView(TextView(this).apply {
+                text = String.format("%.0f", s.cn0)
+                textSize = 11f
+                setTextColor(if (s.used) Ui.TEXT else Ui.MUTED)
+                typeface = Typeface.MONOSPACE
+                gravity = Gravity.END
+                layoutParams = LinearLayout.LayoutParams(
+                    Ui.dp(this@MainActivity, 40f), LinearLayout.LayoutParams.WRAP_CONTENT
+                )
+            })
+            satDetailBox.addView(row)
+        }
+    }
+
+    private fun refreshLog(force: Boolean) {
+        if (!force && lastLogVersion == LogStore.version) return
+        lastLogVersion = LogStore.version
+
+        val lines = LogStore.lines()
+        val card = pages[BottomNav.TAB_LOG]?.findViewWithTag<View>("logCard")
+        if (lines.isEmpty()) {
+            logEmpty.visibility = View.VISIBLE
+            card?.visibility = View.GONE
+        } else {
+            logEmpty.visibility = View.GONE
+            card?.visibility = View.VISIBLE
+            // 最新在底部，保持可读
+            logBody.text = lines.joinToString("\n")
+        }
+    }
+
+    // ==================== 权限 ====================
 
     private fun requestPermissionsThen(action: () -> Unit) {
         val need = mutableListOf<String>()
@@ -446,7 +1097,6 @@ class MainActivity : AppCompatActivity() {
             != PackageManager.PERMISSION_GRANTED
         ) need += Manifest.permission.ACCESS_FINE_LOCATION
 
-        // Android 12+ 蓝牙运行时权限（手机端要广播，需要 ADVERTISE + CONNECT）
         if (Build.VERSION.SDK_INT >= 31) {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_ADVERTISE)
                 != PackageManager.PERMISSION_GRANTED
@@ -468,9 +1118,7 @@ class MainActivity : AppCompatActivity() {
                 ) != PackageManager.PERMISSION_GRANTED
             ) {
                 ActivityCompat.requestPermissions(
-                    this,
-                    arrayOf(Manifest.permission.ACCESS_BACKGROUND_LOCATION),
-                    REQ_BG
+                    this, arrayOf(Manifest.permission.ACCESS_BACKGROUND_LOCATION), REQ_BG
                 )
             } else action()
         } else {
