@@ -105,13 +105,25 @@ class LocationRelayService : Service() {
         super.onCreate()
         isRunning = true
         lm = getSystemService(Context.LOCATION_SERVICE) as LocationManager
-        ServiceCompat.startForeground(
-            this,
-            NOTI_ID,
-            buildNotification("正在转发定位 · 等待盒子连接"),
-            if (Build.VERSION.SDK_INT >= 29)
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION else 0
-        )
+
+        // 前台服务启动保护:
+        // foregroundServiceType=location 在 Android 14 上要求 ACCESS_FINE_LOCATION
+        // 已授予, 否则 startForeground 直接抛 SecurityException, 进程被杀。
+        // 首次安装权限弹窗还没响应时服务被拉起就会闪退 —— 必须兜住。
+        try {
+            ServiceCompat.startForeground(
+                this,
+                NOTI_ID,
+                buildNotification("正在转发定位 · 等待盒子连接"),
+                if (Build.VERSION.SDK_INT >= 29)
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION else 0
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "startForeground 失败: ${e.message}", e)
+            isRunning = false
+            runCatching { stopSelf() }
+            return
+        }
         channel = getSharedPreferences("lanenav", MODE_PRIVATE)
             .getString("channel", "both") ?: "both"
 

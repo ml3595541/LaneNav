@@ -42,6 +42,8 @@ class MainActivity : AppCompatActivity() {
 
     /** 用户主动点过「停止」，本次界面内不再被 onResume 自动拉起 */
     private var userStopped = false
+    /** 有权限请求在途，期间不得启动前台服务 */
+    private var permissionPending = false
     private lateinit var ipLabel: TextView
 
     /** 刷新循环专用 Handler，便于统一取消，避免重复循环。 */
@@ -376,36 +378,77 @@ class MainActivity : AppCompatActivity() {
         return value
     }
 
-    /** 盒子端需要定位权限才能读取"系统实际在用哪个 GPS"，仅用于检测，不采集位置。 */
+    /**
+     * 申请所有运行时权限。
+     *
+     * 关键改动: 原来拆成三次 requestPermissions 连发, 系统会排队弹窗,
+     * 首次安装时用户还在看第一个弹窗, onResume 就已经把前台服务拉起来了 ——
+     * Android 14 的 connectedDevice 前台服务缺蓝牙权限会抛 SecurityException,
+     * 表现就是「第一次第二次打开闪退, 权限给了以后就不闪」。
+     *
+     * 现在合并为一次申请, 并且【权限齐了才启动服务】(见 maybeAutoStart)。
+     */
     private fun requestLocationPermission() {
+        val need = mutableListOf<String>()
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
             != PackageManager.PERMISSION_GRANTED
-        ) {
-            ActivityCompat.requestPermissions(
-                this, arrayOf(Manifest.permission.ACCESS_FINE_LOCATION), REQ_LOC
-            )
-        }
-        // Android 12+ 蓝牙权限（盒子要扫描）
+        ) need += Manifest.permission.ACCESS_FINE_LOCATION
         if (Build.VERSION.SDK_INT >= 31) {
-            val need = mutableListOf<String>()
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN)
                 != PackageManager.PERMISSION_GRANTED
             ) need += Manifest.permission.BLUETOOTH_SCAN
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT)
                 != PackageManager.PERMISSION_GRANTED
             ) need += Manifest.permission.BLUETOOTH_CONNECT
-            if (need.isNotEmpty()) {
-                ActivityCompat.requestPermissions(this, need.toTypedArray(), REQ_BT)
-            }
         }
         if (Build.VERSION.SDK_INT >= 33 &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
             != PackageManager.PERMISSION_GRANTED
-        ) {
-            ActivityCompat.requestPermissions(
-                this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQ_NOTI
-            )
+        ) need += Manifest.permission.POST_NOTIFICATIONS
+
+        if (need.isNotEmpty()) {
+            permissionPending = true
+            ActivityCompat.requestPermissions(this, need.toTypedArray(), REQ_ALL)
         }
+    }
+
+    /**
+     * 前台服务需要的权限是否齐全。
+     *
+     * Android 14: foregroundServiceType=connectedDevice 要求蓝牙三选一;
+     * 定位权限用于读取「系统实际在用哪个 GPS」。
+     */
+    private fun hasServicePermissions(): Boolean {
+        val loc = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) ==
+            PackageManager.PERMISSION_GRANTED
+        if (Build.VERSION.SDK_INT < 31) return loc
+        val bt = ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) ==
+            PackageManager.PERMISSION_GRANTED ||
+            ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) ==
+            PackageManager.PERMISSION_GRANTED
+        return loc && bt
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int, permissions: Array<out String>, grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode != REQ_ALL) return
+        permissionPending = false
+        // 权限结果回来后重新判断能否启动，并把界面刷新一次
+        maybeAutoStart()
+        refresh()
+    }
+
+    /** 权限齐了、且配置允许、且服务没在跑，才自动启动。 */
+    private fun maybeAutoStart() {
+        if (!cfg.autoConnect || userStopped) return
+        if (MockRelayService.isRunning()) return
+        if (permissionPending) return
+        if (!hasServicePermissions()) return
+        val ipRequired = cfg.channel == "tcp"
+        if (ipRequired && cfg.phoneIp.isBlank()) return
+        startRelay()
     }
 
     private fun hasLocationPermission(): Boolean =
@@ -417,13 +460,7 @@ class MainActivity : AppCompatActivity() {
         refresh()
         // 只有「仅 TCP」模式才硬性要求手机 IP；BLE 与双通道不填 IP 也能先跑起来，
         // TCP 部分会在服务内部进入 WAIT_CONFIG 等待，不影响 BLE 注入。
-        val ipRequired = cfg.channel == "tcp"
-        if (cfg.autoConnect && !userStopped &&
-            (!ipRequired || cfg.phoneIp.isNotBlank()) &&
-            !MockRelayService.isRunning()
-        ) {
-            startRelay()
-        }
+        maybeAutoStart()
     }
 
     override fun onPause() {
@@ -532,8 +569,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     companion object {
-        private const val REQ_LOC = 201
-        private const val REQ_NOTI = 202
-        private const val REQ_BT = 203
+        /** 一次申请全部运行时权限 */
+        private const val REQ_ALL = 201
     }
 }

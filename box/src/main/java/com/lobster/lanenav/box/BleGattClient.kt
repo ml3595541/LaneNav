@@ -31,8 +31,10 @@ import com.lobster.lanenav.shared.WireProtocol
  */
 class BleGattClient(private val ctx: Context) {
 
-    private val btManager = ctx.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
-    private val adapter get() = btManager.adapter
+    // 不能直接 as BluetoothManager：部分车机/精简 ROM 上该服务可能为 null，
+    // 类初始化阶段强转会抛 NPE，整个服务起不来。
+    private val btManager = ctx.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+    private val adapter get() = btManager?.adapter
 
     private var gatt: BluetoothGatt? = null
     private var scanning = false
@@ -189,17 +191,21 @@ class BleGattClient(private val ctx: Context) {
 
     @SuppressLint("MissingPermission")
     fun startScan(): Boolean {
-        val ad = adapter ?: run {
-            lastError = "设备不支持蓝牙"
-            return false
-        }
-        if (!ad.isEnabled) {
-            lastError = "蓝牙未开启"
-            return false
-        }
-        if (scanning) return true
-
+        // 整个函数体必须在 try 里。
+        // ad.isEnabled 本身就需要 BLUETOOTH_CONNECT（API 31+），
+        // 原来它在 try 之外 —— 首次安装权限还没授予时直接抛
+        // SecurityException 逃出调用栈，进程崩溃。
         return try {
+            val ad = adapter ?: run {
+                lastError = "设备不支持蓝牙"
+                return false
+            }
+            if (!ad.isEnabled) {
+                lastError = "蓝牙未开启"
+                return false
+            }
+            if (scanning) return true
+
             val filter = ScanFilter.Builder()
                 .setServiceUuid(ParcelUuid(BleProtocol.SERVICE_UUID))
                 .build()
@@ -214,9 +220,14 @@ class BleGattClient(private val ctx: Context) {
                     scanning = false
                     return false
                 }
+            lastError = null
             true
         } catch (e: SecurityException) {
             lastError = "缺少蓝牙权限"
+            scanning = false
+            false
+        } catch (e: Exception) {
+            lastError = "扫描异常: ${e.message}"
             scanning = false
             false
         }
@@ -268,8 +279,8 @@ class BleGattClient(private val ctx: Context) {
         }
     }
 
-    @SuppressLint("MissingPermission")
     fun close() {
+        // stopScan/gatt 操作都需要蓝牙权限；权限被撤销时会抛 SecurityException
         stopScan()
         connected = false
         assembler.reset()

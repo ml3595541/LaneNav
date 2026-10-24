@@ -98,13 +98,33 @@ class MockRelayService : Service() {
         }
         sourceMonitor.start()
         running = true
-        ServiceCompat.startForeground(
-            this,
-            NOTI_ID,
-            buildNotification("启动中…"),
-            if (Build.VERSION.SDK_INT >= 29)
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE else 0
-        )
+
+        // ── 前台服务启动保护 ──
+        // Android 14 (API 34) 起，声明为 connectedDevice 的前台服务在
+        // startForeground() 时要求 BLUETOOTH_CONNECT / SCAN / ADVERTISE
+        // 至少一个已授予，否则直接抛 SecurityException。
+        // 首次安装时权限弹窗还没响应，onResume 就已经把服务拉起来 ——
+        // 异常从 onCreate 抛出，进程被杀，表现为「第一次第二次打开闪退，
+        // 权限给了以后就不闪」。所以这里必须兜住，并且优雅降级。
+        val fgsType = if (Build.VERSION.SDK_INT >= 29 &&
+            hasBtRuntimePermission()
+        ) ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE else 0
+        try {
+            ServiceCompat.startForeground(
+                this,
+                NOTI_ID,
+                buildNotification("启动中…"),
+                fgsType
+            )
+        } catch (e: Exception) {
+            // 没有前台服务权限时不能继续跑：系统会在 5 秒内杀掉服务
+            lastError = "前台服务启动失败: ${e.message}"
+            Log.e(TAG, "startForeground 失败: ${e.message}", e)
+            running = false
+            state = State.STOPPED
+            runCatching { stopSelf() }
+            return
+        }
         acquireWakeLock()
         val ch = cfg.channel
         channelName = ch
@@ -114,11 +134,26 @@ class MockRelayService : Service() {
         if (ch == "tcp" || ch == "both") {
             thread(name = "relay-client", isDaemon = true) { connectLoop() }
         }
-        if (ch == "ble") {
+        if (ch == "ble" || ch == "both") {
+            // both 模式原来不启动 BLE 看门狗 —— BLE 一旦扫描失败或断开,
+            // 就再也不会重试, 只能重开应用。
             thread(name = "ble-watchdog", isDaemon = true) { bleWatchdog() }
         }
         thread(name = "silence-watchdog", isDaemon = true) { silenceWatchdog() }
         thread(name = "rtt-probe", isDaemon = true) { rttProbe() }
+    }
+
+    /** Android 12+ 是否已授予蓝牙运行时权限（前台服务 type 判定用） */
+    private fun hasBtRuntimePermission(): Boolean {
+        if (android.os.Build.VERSION.SDK_INT < 31) return true
+        return try {
+            checkSelfPermission(android.Manifest.permission.BLUETOOTH_SCAN) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED ||
+                checkSelfPermission(android.Manifest.permission.BLUETOOTH_CONNECT) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+        } catch (e: Exception) {
+            false
+        }
     }
 
     // ---------------- 真实链路延时 ----------------
@@ -177,6 +212,8 @@ class MockRelayService : Service() {
         c.onReady = {
             onConnected()
             bleReady = true
+            // 真的连上了，之前的任何 BLE 错误都失效
+            bleError = null
             updateNoti("BLE 已连接 · 正在注入定位")
         }
         c.onDisconnected = {
@@ -188,6 +225,11 @@ class MockRelayService : Service() {
             Log.e(TAG, "BLE 启动失败: " + bleError)
             updateNoti("BLE 启动失败: " + bleError)
         } else {
+            // 关键: 扫描启动成功就把上次的错误清掉。
+            // 原来 bleError 一旦被设置就永不清除 —— 首次安装时权限还没给,
+            // startScan 抛 SecurityException 写入 "缺少蓝牙权限";
+            // 之后权限给了、BLE 也真的连上了, 界面却一直挂着这条假警告。
+            bleError = null
             Log.i(TAG, "BLE 通道已启动，扫描中")
             updateNoti("BLE 扫描中 · 等待手机广播")
         }
