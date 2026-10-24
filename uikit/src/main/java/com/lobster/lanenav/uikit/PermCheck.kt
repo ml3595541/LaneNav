@@ -15,14 +15,14 @@ import androidx.core.content.ContextCompat
  * 分三类：
  *  - 运行时权限（弹窗可授予）
  *  - 特殊权限（AppOps / 电池优化，要跳系统页或 adb）
- *  - 系统开关（定位总开关、蓝牙开关）
+ *  - 系统开关（定位总开关）
  *
- * 每项给出 ok 状态和一句话说明，界面直接渲染。
+ * 每项给出 ok 状态、说明、以及点击后应跳转的目标（jump）。
  */
 object PermCheck {
 
     data class Item(
-        /** 稳定标识，界面据此决定点击后做什么 */
+        /** 稳定标识，界面据此决定点击后跳哪里 */
         val id: String,
         val title: String,
         val detail: String,
@@ -33,9 +33,8 @@ object PermCheck {
 
     // ---------------- 单项检测 ----------------
 
-    fun fineLocation(ctx: Context): Boolean = granted(ctx, android.Manifest.permission.ACCESS_FINE_LOCATION)
-
-    fun coarseLocation(ctx: Context): Boolean = granted(ctx, android.Manifest.permission.ACCESS_COARSE_LOCATION)
+    fun fineLocation(ctx: Context): Boolean =
+        granted(ctx, android.Manifest.permission.ACCESS_FINE_LOCATION)
 
     fun backgroundLocation(ctx: Context): Boolean {
         if (Build.VERSION.SDK_INT < 29) return true
@@ -47,18 +46,33 @@ object PermCheck {
         return granted(ctx, android.Manifest.permission.POST_NOTIFICATIONS)
     }
 
-    /** Android 12+ 蓝牙三件套；12 以下只需老 BLUETOOTH 权限。 */
-    fun bluetooth(ctx: Context): Boolean {
+    /**
+     * 蓝牙「广播」权限：手机端作为外设广播，需要 ADVERTISE。
+     * 12 以下无此概念，视为已授予。
+     */
+    fun btAdvertise(ctx: Context): Boolean {
         if (Build.VERSION.SDK_INT < 31) {
             return granted(ctx, android.Manifest.permission.BLUETOOTH)
         }
-        return granted(ctx, android.Manifest.permission.BLUETOOTH_SCAN) &&
-            granted(ctx, android.Manifest.permission.BLUETOOTH_CONNECT)
+        return granted(ctx, android.Manifest.permission.BLUETOOTH_ADVERTISE)
     }
 
-    fun bluetoothAdvertise(ctx: Context): Boolean {
-        if (Build.VERSION.SDK_INT < 31) return true
-        return granted(ctx, android.Manifest.permission.BLUETOOTH_ADVERTISE)
+    /**
+     * 蓝牙「扫描」权限：盒子端作为客户端搜索手机，需要 SCAN。
+     */
+    fun btScan(ctx: Context): Boolean {
+        if (Build.VERSION.SDK_INT < 31) {
+            return granted(ctx, android.Manifest.permission.BLUETOOTH)
+        }
+        return granted(ctx, android.Manifest.permission.BLUETOOTH_SCAN)
+    }
+
+    /** 蓝牙「连接」权限：两端都需要（GATT 服务端/客户端收发数据）。 */
+    fun btConnect(ctx: Context): Boolean {
+        if (Build.VERSION.SDK_INT < 31) {
+            return granted(ctx, android.Manifest.permission.BLUETOOTH)
+        }
+        return granted(ctx, android.Manifest.permission.BLUETOOTH_CONNECT)
     }
 
     /** 系统定位总开关是否打开。关闭时即使有权限也拿不到定位。 */
@@ -123,133 +137,126 @@ object PermCheck {
 
     // ---------------- 两端清单 ----------------
 
-    /** 手机端：采集定位并转发。 */
+    /**
+     * 手机端：采集定位并**广播**给盒子。
+     *
+     * 注意：手机端从不扫描，因此**不检查 BLUETOOTH_SCAN**。
+     * 早期版本按「扫描+连接」判定，导致蓝牙通道明明正常工作
+     * 却永远报「未授予蓝牙权限」。
+     */
     fun phone(ctx: Context): List<Item> = buildList {
+        add(itemFine(ctx))
+        add(itemBackground(ctx))
+
+        val adv = btAdvertise(ctx)
         add(
             Item(
-                "fine",
-                "精确定位",
-                if (fineLocation(ctx)) "已授予" else "未授予 · 无法采集 GNSS",
-                fineLocation(ctx)
+                "btadv", "蓝牙广播",
+                if (adv) "已授予" else "未授予 · 盒子搜不到手机",
+                adv
             )
         )
+        val conn = btConnect(ctx)
         add(
             Item(
-                "bg",
-                "后台定位",
-                if (backgroundLocation(ctx)) "已授予" else "未授予 · 息屏后可能断流",
-                backgroundLocation(ctx)
+                "btconn", "蓝牙连接",
+                if (conn) "已授予" else "未授予 · 无法与盒子收发数据",
+                conn
             )
         )
+
+        add(itemLocationSwitch(ctx))
+        add(itemNoti(ctx))
+        add(itemBattery(ctx))
+    }
+
+    /**
+     * 盒子端：**扫描**手机并注入模拟位置。
+     */
+    fun box(ctx: Context): List<Item> = buildList {
+        val mock = mockLocation(ctx)
         add(
             Item(
-                "noti",
-                "通知权限",
-                if (notifications(ctx)) "已授予" else "未授予 · 前台服务通知不可见",
-                notifications(ctx),
-                critical = false
+                "mock", "模拟位置授权",
+                if (mock) "已授权" else "未授权 · 注入完全无效（最致命）",
+                mock
             )
         )
+        add(itemFine(ctx))
+
+        val scan = btScan(ctx)
         add(
             Item(
-                "bt",
-                "蓝牙权限",
-                if (bluetooth(ctx)) "已授予" else "未授予 · BLE 通道不可用",
-                bluetooth(ctx)
+                "btscan", "蓝牙扫描",
+                if (scan) "已授予" else "未授予 · 搜不到手机",
+                scan
             )
         )
+        val conn = btConnect(ctx)
         add(
             Item(
-                "btadv",
-                "蓝牙广播",
-                if (bluetoothAdvertise(ctx)) "已授予" else "未授予 · 盒子搜不到手机",
-                bluetoothAdvertise(ctx)
+                "btconn", "蓝牙连接",
+                if (conn) "已授予" else "未授予 · 无法与手机收发数据",
+                conn
             )
         )
-        add(
-            Item(
-                "locsvc",
-                "系统定位开关",
-                if (locationEnabled(ctx)) "已开启" else "已关闭 · 权限给了也拿不到坐标",
-                locationEnabled(ctx)
-            )
-        )
-        add(
-            Item(
-                "battery",
-                "忽略电池优化",
-                if (batteryUnrestricted(ctx)) "已豁免" else "未豁免 · 建议在系统设置里设无限制",
-                batteryUnrestricted(ctx),
-                critical = false
-            )
+
+        add(itemLocationSwitch(ctx))
+        add(itemNoti(ctx))
+        add(itemBattery(ctx))
+    }
+
+    // ---------------- 单项目工厂（两端共用文案） ----------------
+
+    private fun itemFine(ctx: Context): Item {
+        val ok = fineLocation(ctx)
+        return Item(
+            "fine", "精确定位",
+            if (ok) "已授予" else "未授予 · 无法采集 GNSS",
+            ok
         )
     }
 
-    /** 盒子端：注入模拟位置。 */
-    fun box(ctx: Context): List<Item> = buildList {
-        add(
-            Item(
-                "mock",
-                "模拟位置授权",
-                if (mockLocation(ctx)) "已授权" else "未授权 · 注入完全无效（最致命）",
-                mockLocation(ctx)
-            )
+    private fun itemBackground(ctx: Context): Item {
+        val ok = backgroundLocation(ctx)
+        return Item(
+            "bg", "后台定位",
+            if (ok) "已授予" else "未授予 · 息屏后可能断流",
+            ok
         )
-        add(
-            Item(
-                "fine",
-                "定位权限",
-                if (fineLocation(ctx)) "已授予" else "未授予 · 无法读取自身 GPS 状态",
-                fineLocation(ctx)
-            )
+    }
+
+    private fun itemLocationSwitch(ctx: Context): Item {
+        val ok = locationEnabled(ctx)
+        return Item(
+            "locsvc", "系统定位开关",
+            if (ok) "已开启" else "已关闭 · 权限给了也拿不到坐标",
+            ok
         )
-        add(
-            Item(
-                "locsvc",
-                "系统定位开关",
-                if (locationEnabled(ctx)) "已开启" else "已关闭 · 导航软件无法定位",
-                locationEnabled(ctx)
-            )
+    }
+
+    private fun itemNoti(ctx: Context): Item {
+        val ok = notifications(ctx)
+        return Item(
+            "noti", "通知权限",
+            if (ok) "已授予" else "未授予 · 前台服务通知不可见",
+            ok,
+            critical = false
         )
-        add(
-            Item(
-                "bt",
-                "蓝牙权限",
-                if (bluetooth(ctx)) "已授予" else "未授予 · BLE 通道不可用",
-                bluetooth(ctx)
-            )
-        )
-        add(
-            Item(
-                "btadv",
-                "蓝牙广播/扫描",
-                if (bluetoothAdvertise(ctx)) "已授予" else "未授予 · 扫描不到手机",
-                bluetoothAdvertise(ctx)
-            )
-        )
-        add(
-            Item(
-                "noti",
-                "通知权限",
-                if (notifications(ctx)) "已授予" else "未授予 · 前台服务通知不可见",
-                notifications(ctx),
-                critical = false
-            )
-        )
-        add(
-            Item(
-                "battery",
-                "忽略电池优化",
-                if (batteryUnrestricted(ctx)) "已豁免" else "未豁免 · 车机休眠后可能断开",
-                batteryUnrestricted(ctx),
-                critical = false
-            )
+    }
+
+    private fun itemBattery(ctx: Context): Item {
+        val ok = batteryUnrestricted(ctx)
+        return Item(
+            "battery", "忽略电池优化",
+            if (ok) "已豁免" else "未豁免 · 建议在系统设置里设无限制",
+            ok,
+            critical = false
         )
     }
 
     /** 缺失的项数（只统计 critical）。 */
-    fun missingCritical(items: List<Item>): Int =
-        items.count { !it.ok && it.critical }
+    fun missingCritical(items: List<Item>): Int = items.count { !it.ok && it.critical }
 
     fun allOk(items: List<Item>): Boolean = items.all { it.ok }
 }

@@ -786,8 +786,8 @@ class MainActivity : AppCompatActivity() {
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ).apply { topMargin = Ui.dp(ctx, 10f) }
         }
-        permBtnRow.addView(Ui.primaryButton(ctx, "申请权限", accent) {
-            requestPermissionsThen { refreshPermsNow() }
+        permBtnRow.addView(Ui.primaryButton(ctx, "申请缺失权限", accent) {
+            requestMissingPermissions()
         })
         permBtnRow.addView(Ui.ghostButton(ctx, "系统设置", accent) {
             openAppSettings()
@@ -958,7 +958,87 @@ class MainActivity : AppCompatActivity() {
             setTextColor(dotColor)
             typeface = Typeface.MONOSPACE
         })
+
+        // 未通过的项可点击，直接跳到能解决它的系统页面
+        if (!item.ok) {
+            row.addView(TextView(ctx).apply {
+                text = " ›"
+                textSize = 17f
+                setTextColor(Ui.MUTED)
+                typeface = Typeface.MONOSPACE
+            })
+            row.isClickable = true
+            row.isFocusable = true
+            row.setOnClickListener { openPermTarget(item.id) }
+            // 点击反馈
+            row.background = android.graphics.drawable.RippleDrawable(
+                android.content.res.ColorStateList.valueOf(Ui.alpha(accent, 0.12f)),
+                null, null
+            )
+        }
         return row
+    }
+
+    /** 点击权限项：跳到能解决该项的系统页面。 */
+    private fun openPermTarget(id: String) {
+        when (id) {
+            // 运行时权限：直接弹窗
+            "fine", "btadv", "btconn" -> {
+                requestPermissionsThen {
+                    lastPermSig = ""
+                    refreshPermsNow()
+                }
+            }
+            // 后台定位：Android 11+ 不能单独弹窗，必须去应用详情页选「始终允许」
+            "bg" -> {
+                Toast.makeText(
+                    this,
+                    "请在「权限 → 位置信息」中选择「始终允许」",
+                    Toast.LENGTH_LONG
+                ).show()
+                openAppSettings()
+            }
+            // 系统定位总开关
+            "locsvc" -> {
+                val ok = runCatching {
+                    startActivity(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS))
+                }.isSuccess
+                if (!ok) openAppSettings()
+            }
+            // 通知设置
+            "noti" -> {
+                val ok = runCatching {
+                    startActivity(
+                        Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                            .putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+                    )
+                }.isSuccess
+                if (!ok) openAppSettings()
+            }
+            // 电池优化
+            "battery" -> openBatterySettings()
+            // 兜底：应用详情页
+            else -> openAppSettings()
+        }
+    }
+
+    private fun openBatterySettings() {
+        // 优先直接弹系统对话框
+        val direct = runCatching {
+            startActivity(
+                Intent(
+                    Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                    Uri.parse("package:$packageName")
+                )
+            )
+        }.isSuccess
+        if (!direct) {
+            // 兜底：跳电池优化列表，用户自己找本应用
+            val listed = runCatching {
+                startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+            }.isSuccess
+            if (!listed) openAppSettings()
+        }
     }
 
     /** 只在状态变化时重建，避免每秒刷 View。 */
@@ -1253,6 +1333,36 @@ class MainActivity : AppCompatActivity() {
     private fun requestPermissionsThen(action: () -> Unit) {
         pendingAction = action
         doRequestPermissions()
+    }
+
+    /** 只申请当前缺失的运行时权限（供设置页「申请权限」按钮用）。 */
+    private fun requestMissingPermissions() {
+        val need = mutableListOf<String>()
+
+        if (!PermCheck.fineLocation(this)) {
+            need += Manifest.permission.ACCESS_FINE_LOCATION
+        }
+        if (Build.VERSION.SDK_INT >= 31) {
+            if (!PermCheck.btAdvertise(this)) need += Manifest.permission.BLUETOOTH_ADVERTISE
+            if (!PermCheck.btConnect(this)) need += Manifest.permission.BLUETOOTH_CONNECT
+        }
+        if (Build.VERSION.SDK_INT >= 33 && !PermCheck.notifications(this)) {
+            need += Manifest.permission.POST_NOTIFICATIONS
+        }
+
+        if (need.isEmpty()) {
+            // 运行时权限都齐了，问题在特殊权限/系统开关，引导去设置页
+            Toast.makeText(
+                this,
+                "运行时权限已齐全，请逐个点击未通过的项跳转设置",
+                Toast.LENGTH_LONG
+            ).show()
+            lastPermSig = ""
+            refreshPermsNow()
+        } else {
+            pendingAction = { lastPermSig = ""; refreshPermsNow() }
+            ActivityCompat.requestPermissions(this, need.toTypedArray(), REQ_BASIC)
+        }
     }
 
     private fun doRequestPermissions() {

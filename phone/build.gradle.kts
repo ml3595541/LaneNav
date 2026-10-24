@@ -11,8 +11,8 @@ android {
         applicationId = "com.lobster.lanenav.phone"
         minSdk = 30        // Android 11+
         targetSdk = 34
-        versionCode = 18
-        versionName = "0.5.1"
+        versionCode = 19
+        versionName = "0.5.2"
     }
 
     // 正式签名：仅在提供 keystore 路径时启用（由 build.sh --release 注入环境变量）
