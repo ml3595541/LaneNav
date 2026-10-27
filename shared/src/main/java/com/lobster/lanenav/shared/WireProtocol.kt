@@ -10,6 +10,13 @@ object WireProtocol {
     const val CMD_WAKE = "wake"
     const val CMD_PING = "ping"
     const val CMD_PONG = "pong"
+
+    /**
+     * 心跳。手机在没有 GPS 定位时（隧道 / 地库 / 高楼遮挡）也必须发，
+     * 否则盒子无法区分「只是没有 GPS」和「链路真的断了」，
+     * 只能一律当作断流处理，出隧道后还会停在「已断开」不恢复。
+     */
+    const val CMD_HB = "hb"
     const val CMD_RTT = "rtt"
     const val DEFAULT_PORT = 19800
 
@@ -31,6 +38,8 @@ object WireProtocol {
     fun ping(ts: Long): String = """{"cmd":"ping","t":$ts}"""
 
     fun pong(ts: Long): String = """{"cmd":"pong","t":$ts}"""
+
+    fun heartbeat(ts: Long): String = """{"cmd":"hb","t":$ts}"""
 
     /** 从 ping/pong 行中取出时间戳；不是该类型返回 null。 */
     fun parseTs(line: String, cmd: String): Long? {

@@ -49,6 +49,9 @@ class MockRelayService : Service() {
     @Volatile private var out: BufferedWriter? = null
 
     private var consecutiveFail = 0
+
+    /** 最近一次收到任何报文（定位/心跳/pong）的时刻，用于区分「无 GPS」与「链路断」 */
+    @Volatile private var lastLinkAliveAt = 0L
     /** 断流起始时刻, 用于回差判定 */
     private var silentSince = 0L
     /** 重新接管所需的连续帧计数 */
@@ -219,6 +222,7 @@ class MockRelayService : Service() {
         c.onDisconnected = {
             bleReady = false
         }
+        c.onLinkAlive = { lastLinkAliveAt = System.currentTimeMillis() }
         bleClient = c
         if (!c.startScan()) {
             bleError = c.lastError ?: "BLE 启动失败"
@@ -271,6 +275,7 @@ class MockRelayService : Service() {
     /** 收到一帧定位（TCP 或 BLE 共用）。 */
     private fun handlePacket(pkt: LocationPacket, fromBle: Boolean = false) {
         val now = System.currentTimeMillis()
+        lastLinkAliveAt = now
 
         // 双通道去重: 同一帧（时间戳不新）直接丢弃
         if (pkt.ts > 0 && pkt.ts <= lastInjectedTs) return
@@ -287,10 +292,18 @@ class MockRelayService : Service() {
             reacquireLastMs = now
             reacquireCount++
 
-            if (reacquireCount >= REACQUIRE_FRAMES) {
+            // 链路一直在（心跳没断）说明只是隧道里丢星，GPS 一回来就该立刻接管；
+            // 链路断过则需要更多帧确认，避免热点抖动造成来回抽搐。
+            val linkAlive = lastLinkAliveAt > 0 && now - lastLinkAliveAt < LINK_ALIVE_MS
+            val needFrames = if (linkAlive) REACQUIRE_FRAMES_FAST else REACQUIRE_FRAMES
+
+            if (reacquireCount >= needFrames) {
                 releasedForSilence = false
                 reacquireCount = 0
                 reacquireLastMs = 0L
+                // 关键修复：原来没有恢复状态，出隧道后注入其实已恢复，
+                // 但界面一直显示「已断开 · 重连中」，看起来就是不会自动恢复。
+                state = State.RUNNING
                 Log.i(TAG, "手机数据连续恢复，重新接管系统定位")
                 updateNoti("手机数据恢复 · 重新接管定位")
             }
@@ -352,9 +365,19 @@ class MockRelayService : Service() {
                 releasedForSilence = true
                 silentSince = 0L
                 runCatching { injector.release() }
-                state = State.DISCONNECTED
-                updateNoti("手机 ${silentMs / 1000}s 无数据 · 已交还真实 GPS")
-                Log.w(TAG, "断流 ${silentMs}ms(阈值${threshold}ms)，已释放模拟提供器让真实 GPS 接管")
+
+                // 链路还在（心跳不断）→ 只是没有 GPS，属于正常情况，不要当故障
+                val linkAlive = lastLinkAliveAt > 0 && now - lastLinkAliveAt < LINK_ALIVE_MS
+                state = if (linkAlive) State.NO_FIX else State.DISCONNECTED
+                updateNoti(
+                    if (linkAlive) "无 GPS 信号 · 链路正常 · 已交还真实 GPS"
+                    else "链路中断 · 已交还真实 GPS"
+                )
+                Log.w(
+                    TAG,
+                    "断流 ${silentMs}ms(阈值${threshold}ms) 链路=" +
+                        (if (linkAlive) "正常" else "中断") + "，已释放模拟提供器"
+                )
             } else if (silentMs <= threshold) {
                 silentSince = 0L
             }
@@ -412,7 +435,15 @@ class MockRelayService : Service() {
                         // 测速回包优先处理：pong 不是定位 JSON
                         val pongTs = WireProtocol.parseTs(line, WireProtocol.CMD_PONG)
                         if (pongTs != null) {
+                            lastLinkAliveAt = System.currentTimeMillis()
                             onPong(pongTs, fromBle = false)
+                            continue
+                        }
+
+                        // 心跳：链路活着，但此刻可能没有 GPS（隧道/地库）
+                        val hbTs = WireProtocol.parseTs(line, WireProtocol.CMD_HB)
+                        if (hbTs != null) {
+                            lastLinkAliveAt = System.currentTimeMillis()
                             continue
                         }
 
@@ -560,7 +591,12 @@ class MockRelayService : Service() {
         } catch (_: Exception) {}
     }
 
-    enum class State { STOPPED, WAIT_CONFIG, CONNECTING, DISCONNECTED, NO_MOCK_PERMISSION, RUNNING }
+    enum class State {
+        STOPPED, WAIT_CONFIG, CONNECTING, DISCONNECTED, NO_MOCK_PERMISSION, RUNNING,
+
+        /** 链路正常，但没有定位（隧道 / 地库 / 信号弱）。不是故障。 */
+        NO_FIX
+    }
 
     companion object {
         private const val TAG = "LaneNavBox"
@@ -572,12 +608,18 @@ class MockRelayService : Service() {
         private const val RELEASE_HOLD_MS = 4_000L
         /** 重新接管需要连续多少帧 */
         private const val REACQUIRE_FRAMES = 3
+
+        /** 链路未断（心跳在）时只要 2 帧就接管，出隧道恢复更快 */
+        private const val REACQUIRE_FRAMES_FAST = 2
         /** 帧间隔超过此值即认为「不连续」, 计数归零 */
         private const val REACQUIRE_GAP_MS = 3_000L
         /** 省电模式（0.1Hz）下的断流阈值，需大于手机 10s 的推送间隔 */
         private const val SILENCE_RELEASE_ECO_MS = 40_000L
         /** TCP 读超时：超过此时长无数据即认定连接假死，主动断开重连 */
         private const val TCP_READ_TIMEOUT_MS = 30_000
+
+        /** 心跳多久没来就算链路中断（手机每 2s 发一次） */
+        private const val LINK_ALIVE_MS = 8_000L
 
         @Volatile var state: State = State.STOPPED
         @Volatile var lastFixText: String = "无"

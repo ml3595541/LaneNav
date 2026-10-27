@@ -55,6 +55,8 @@ class BleGattClient(private val ctx: Context) {
     var onReady: (() -> Unit)? = null
     /** 断开回调，外层据此重连 */
     var onDisconnected: (() -> Unit)? = null
+    /** 收到心跳：链路活着（可能没有 GPS） */
+    var onLinkAlive: (() -> Unit)? = null
 
     private var cmdChar: BluetoothGattCharacteristic? = null
 
@@ -183,7 +185,13 @@ class BleGattClient(private val ctx: Context) {
         // 测速回包优先处理：它不是定位 JSON，交给 fromJson 会被丢弃。
         val pongTs = WireProtocol.parseTs(text, WireProtocol.CMD_PONG)
         if (pongTs != null) {
+            onLinkAlive?.invoke()
             onPong?.invoke(pongTs)
+            return
+        }
+        // 心跳不是定位 JSON，不能交给 fromJson
+        if (WireProtocol.parseTs(text, WireProtocol.CMD_HB) != null) {
+            onLinkAlive?.invoke()
             return
         }
         LocationPacket.fromJson(text)?.let { onPacket?.invoke(it) }

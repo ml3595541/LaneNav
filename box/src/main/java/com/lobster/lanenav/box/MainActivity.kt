@@ -780,6 +780,8 @@ class MainActivity : AppCompatActivity() {
                 Triple(Ui.ERR, "缺少模拟位置权限", Ui.ERR)
             st == MockRelayService.State.WAIT_CONFIG ->
                 Triple(Ui.WARN, "未配置手机地址", Ui.WARN)
+            st == MockRelayService.State.NO_FIX ->
+                Triple(Ui.WARN, "隧道中 · 无 GPS", Ui.WARN)
             st == MockRelayService.State.DISCONNECTED ->
                 Triple(Ui.ERR, "已断开 · 重连中", Ui.ERR)
             else -> Triple(Ui.DIM, "未启动", Ui.TEXT)
@@ -838,7 +840,10 @@ class MainActivity : AppCompatActivity() {
 
         // ---- 警告 ----
         val warns = mutableListOf<String>()
-        if (ageSec > 10) warns += "已 ${ageSec}s 未收到定位（断流）"
+        // 隧道里没有定位是正常的，不要报成故障
+        if (ageSec > 10 && st == MockRelayService.State.RUNNING) {
+            warns += "已 ${ageSec}s 未收到定位（断流）"
+        }
         MockRelayService.bleError?.let { warns += "BLE：$it" }
         MockRelayService.lastError?.let {
             if (st != MockRelayService.State.RUNNING) warns += it

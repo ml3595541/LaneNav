@@ -151,6 +151,34 @@ class LocationRelayService : Service() {
         acquireLocks()
         startHeading()
         startLocationUpdates()
+        startHeartbeat()
+    }
+
+    /**
+     * 心跳线程：无论有没有 GPS 都维持链路活动。
+     *
+     * 隧道里 GNSS 完全无信号，手机自然没有定位可发。原本完全静默，
+     * 盒子 15s 后就判定断流并交还真实 GPS，出隧道时状态还停在「已断开」。
+     * 心跳让「无 GPS」和「链路断开」成为两件可分辨的事。
+     */
+    private fun startHeartbeat() {
+        thread(name = "relay-hb", isDaemon = true) {
+            while (isRunning) {
+                try {
+                    Thread.sleep(HEARTBEAT_MS)
+                } catch (e: InterruptedException) {
+                    break
+                }
+                if (!isRunning) break
+                if (conns.isEmpty() && (bleServer?.clientCount ?: 0) == 0) continue
+
+                val hb = WireProtocol.heartbeat(System.currentTimeMillis())
+                if (conns.isNotEmpty()) {
+                    while (!txQueue.offer(hb)) txQueue.poll()
+                }
+                runCatching { bleServer?.sendRaw(hb) }
+            }
+        }
     }
 
     /**
@@ -281,6 +309,7 @@ class LocationRelayService : Service() {
             bsrc = bsrc
         )
         current = pkt
+        lastPushAt = now
         updateHeadingSummary(bearing, bsrc)
         lastAccuracy = acc
         lastFixSummary = String.format(
@@ -563,6 +592,9 @@ class LocationRelayService : Service() {
         /** 车速高于此值(m/s)且 GNSS 有航向时优先用 GNSS; 低于则改用传感器。约 13km/h */
         private const val GNSS_BEARING_MIN_SPEED = 3.6f
 
+        /** 心跳间隔。盒子 8s 没收到心跳就判定链路中断，2s 留足冗余。 */
+        private const val HEARTBEAT_MS = 2_000L
+
         @Volatile var isRunning = false
         @Volatile var clientCount = 0
         @Volatile var bleClientCount = 0
@@ -574,5 +606,7 @@ class LocationRelayService : Service() {
         @Volatile var lastHeadingSummary: String = "无"
         /** 最近一次定位精度（米），-1 = 无 */
         @Volatile var lastAccuracy: Float = -1f
+        /** 最近一次产出定位包的时刻，用于界面判断「是否在等 GPS」 */
+        @Volatile var lastPushAt: Long = 0
     }
 }

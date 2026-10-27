@@ -1185,7 +1185,14 @@ class MainActivity : AppCompatActivity() {
         val rtt = LocationRelayService.lastRtt
         metricRtt.text = if (rtt > 0) "${rtt}ms" else "—"
         metricHeading.text = LocationRelayService.lastHeadingSummary
-        metricFix.text = "最近定位：${LocationRelayService.lastFixSummary}"
+        // 长时间没有定位：隧道/地库属于正常，明确提示，避免误以为转发坏了
+        val sinceFix = if (LocationRelayService.lastPushAt > 0)
+            (System.currentTimeMillis() - LocationRelayService.lastPushAt) / 1000 else -1
+        metricFix.text = when {
+            sinceFix < 0 -> "最近定位：—"
+            sinceFix > 5 -> "等待 GPS 信号（${sinceFix}s）· 链路正常"
+            else -> "最近定位：${LocationRelayService.lastFixSummary}"
+        }
 
         val err = LocationRelayService.bleError
         if (err != null) {
