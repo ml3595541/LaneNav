@@ -881,10 +881,69 @@ class MainActivity : AppCompatActivity() {
                 Toast.makeText(this@MainActivity, "微信号已复制", Toast.LENGTH_SHORT).show()
             }
         })
+        // ---------- 退出 ----------
+        val exitCard = Ui.card(ctx)
+        exitCard.addView(Ui.sectionLabel(ctx, "退出", Ui.ERR))
+        exitCard.addView(
+            Ui.body(
+                ctx,
+                "彻底停止转发并释放 GPS 占用。退出后车机会自动切回自带 GPS，" +
+                    "本应用不再后台定位，也不再耗电。"
+            )
+        )
+        val exitRow = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = Ui.dp(ctx, 12f) }
+        }
+        exitRow.addView(Ui.ghostButton(ctx, "退出软件", Ui.ERR) { confirmExit() })
+        exitCard.addView(exitRow)
+        root.addView(exitCard)
+
         root.addView(footer)
 
         root.addView(Ui.spacer(ctx, 20f))
         return pageScroll(root)
+    }
+
+    /** 退出前二次确认：这是会中断导航的操作。 */
+    private fun confirmExit() {
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("退出软件？")
+            .setMessage(
+                "将停止定位转发并释放 GPS 占用。\n\n" +
+                    "退出后车机会自动恢复使用自带 GPS，导航不会中断。"
+            )
+            .setPositiveButton("退出") { _, _ -> doExit() }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    /**
+     * 安全退出。
+     *
+     * 顺序很重要：先让服务做完整清理（移除定位更新、注销 GNSS 回调、
+     * 停蓝牙、断链路、释放锁、移除通知），再结束界面与进程。
+     * 直接杀进程会跳过 onDestroy，系统可能仍认为本应用持有定位。
+     */
+    private fun doExit() {
+        if (LocationRelayService.isRunning) {
+            runCatching {
+                startService(
+                    Intent(this, LocationRelayService::class.java)
+                        .setAction(LocationRelayService.ACTION_EXIT)
+                )
+            }
+        }
+        // 给清理留出时间（全部是本地同步操作，260ms 足够）
+        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+            runCatching { finishAffinity() }
+            runCatching {
+                android.os.Process.killProcess(android.os.Process.myPid())
+            }
+        }, 260)
     }
 
     /** 渲染权限清单。 */

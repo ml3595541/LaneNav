@@ -252,6 +252,20 @@ class LocationRelayService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // 用户主动退出：必须走 START_NOT_STICKY，
+        // 否则系统会把 START_STICKY 的服务重新拉起来，等于没退出。
+        if (intent?.action == ACTION_EXIT) {
+            Log.i(TAG, "收到退出指令，开始释放资源")
+            LogStore.add("SVC", "用户退出：释放定位与链路")
+            cleanup()
+            runCatching {
+                ServiceCompat.stopForeground(
+                    this, ServiceCompat.STOP_FOREGROUND_REMOVE
+                )
+            }
+            stopSelf()
+            return START_NOT_STICKY
+        }
         // 被系统杀掉后自动重建
         return START_STICKY
     }
@@ -566,20 +580,43 @@ class LocationRelayService : Service() {
     }
 
     override fun onDestroy() {
+        cleanup()
+        super.onDestroy()
+    }
+
+    /**
+     * 释放全部资源。退出、被系统停掉、崩溃后重建都会走这里。
+     *
+     * 逐项都必须做，少一项就会留下「系统仍在定位」的后台副作用：
+     *  - removeUpdates / unregisterGnssStatusCallback：停止 GPS 抓取
+     *  - heading.stop：停用传感器（磁力计/陀螺仪）
+     *  - bleServer.stop：停广播并断开盒子
+     *  - 关 socket：让盒子立刻感知断开，而不是等超时
+     *  - releaseLocks：释放 WifiLock / WakeLock，避免退出后仍在耗电
+     */
+    private fun cleanup() {
         isRunning = false
         runCatching { lm.removeUpdates(listener) }
-        heading?.stop()
+        runCatching { heading?.stop() }
         heading = null
-        if (Build.VERSION.SDK_INT >= 24) runCatching { lm.unregisterGnssStatusCallback(gnssCallback) }
+        if (Build.VERSION.SDK_INT >= 24) {
+            runCatching { lm.unregisterGnssStatusCallback(gnssCallback) }
+        }
         runCatching { bleServer?.stop() }
+        bleServer = null
         conns.forEach { c ->
             runCatching { c.w?.close() }
             runCatching { c.sock.close() }
         }
         conns.clear()
         runCatching { server?.close() }
+        server = null
         releaseLocks()
-        super.onDestroy()
+
+        clientCount = 0
+        bleClientCount = 0
+        lastPushAt = 0
+        Log.i(TAG, "资源已释放")
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -588,6 +625,9 @@ class LocationRelayService : Service() {
         private const val TAG = "LaneNavPhone"
         private const val CHANNEL = "relay"
         private const val NOTI_ID = 1001
+
+        /** 用户主动退出。收到后彻底释放定位并停止服务。 */
+        const val ACTION_EXIT = "com.lobster.lanenav.phone.ACTION_EXIT"
 
         /** 车速高于此值(m/s)且 GNSS 有航向时优先用 GNSS; 低于则改用传感器。约 13km/h */
         private const val GNSS_BEARING_MIN_SPEED = 3.6f
