@@ -10,3 +10,8 @@ dist/
 *.jks
 *.keystore
 keystore.pass
+
+# 构建产物，绝不入库
+*.dex
+*.apk
+*.aab
