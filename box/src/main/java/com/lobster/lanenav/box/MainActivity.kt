@@ -389,13 +389,9 @@ class MainActivity : AppCompatActivity() {
         val ballSwitch = Ui.checkbox(ctx, "后台运行时显示连接状态", cfg.floatBall, accent)
         ballSwitch.setOnCheckedChangeListener { _, checked ->
             if (checked && !FloatingBall.canShow(this)) {
-                // 没有悬浮窗权限时不能开，直接把开关退回去并引导授权
+                // 没有权限时开关退回，并弹窗说明后再引导授权
                 ballSwitch.isChecked = false
-                android.widget.Toast.makeText(
-                    this, "请先授予「显示在其他应用上层」权限",
-                    android.widget.Toast.LENGTH_LONG
-                ).show()
-                openOverlaySettings()
+                promptOverlayPermission()
                 return@setOnCheckedChangeListener
             }
             cfg.floatBall = checked
@@ -460,6 +456,30 @@ class MainActivity : AppCompatActivity() {
         })
 
         requestLocationPermission()
+    }
+
+    /** 本次进入界面后是否已提示过悬浮窗权限，避免反复弹 */
+    private var overlayPrompted = false
+
+    /**
+     * 悬浮窗权限弹窗。
+     *
+     * 直接用 Toast 会一闪而过，用户来不及看清要授权什么；
+     * 这里先解释清楚用途，点「去授权」再跳系统页。
+     */
+    private fun promptOverlayPermission() {
+        if (overlayPrompted) return
+        overlayPrompted = true
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("需要悬浮窗权限")
+            .setMessage(
+                "悬浮球需要「显示在其他应用上层」权限才能显示。\n\n" +
+                    "授权后返回本应用即可生效。\n" +
+                    "不授权不影响定位转发，只是看不到悬浮球。"
+            )
+            .setPositiveButton("去授权") { _, _ -> openOverlaySettings() }
+            .setNegativeButton("取消", null)
+            .show()
     }
 
     /** 跳系统「显示在其他应用上层」授权页。 */
@@ -800,6 +820,11 @@ class MainActivity : AppCompatActivity() {
         super.onResume()
         lastPermSig = ""
         refresh()
+
+        // 悬浮球开着但权限被撤销（换机、系统清理、跨版本升级）时主动提醒
+        if (cfg.floatBall && !FloatingBall.canShow(this) && !overlayPrompted) {
+            promptOverlayPermission()
+        }
         // 只有「仅 TCP」模式才硬性要求手机 IP；BLE 与双通道不填 IP 也能先跑起来，
         // TCP 部分会在服务内部进入 WAIT_CONFIG 等待，不影响 BLE 注入。
         maybeAutoStart()

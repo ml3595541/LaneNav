@@ -826,14 +826,9 @@ class MainActivity : AppCompatActivity() {
         )
         ballSwitch.setOnCheckedChangeListener { _, checked ->
             if (checked && !FloatingBall.canShow(this)) {
-                // 未授权时不能开：立刻退回开关，并主动拉起授权页
+                // 未授权时开关退回，先弹窗解释用途，再引导授权
                 ballSwitch.isChecked = false
-                Toast.makeText(
-                    this,
-                    "需要「显示在其他应用上层」权限，已为你打开设置",
-                    Toast.LENGTH_LONG
-                ).show()
-                openOverlaySettings()
+                promptOverlayPermission()
                 return@setOnCheckedChangeListener
             }
             ballSp.edit().putBoolean("float_ball", checked).apply()
@@ -1127,6 +1122,25 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /** 本次进入界面后是否已提示过悬浮窗权限 */
+    private var overlayPrompted = false
+
+    /** 悬浮窗权限弹窗：先说明用途，点「去授权」再跳系统页。 */
+    private fun promptOverlayPermission() {
+        if (overlayPrompted) return
+        overlayPrompted = true
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("需要悬浮窗权限")
+            .setMessage(
+                "悬浮球需要「显示在其他应用上层」权限才能显示。\n\n" +
+                    "授权后返回本应用即可生效。\n" +
+                    "不授权不影响定位转发，只是看不到悬浮球。"
+            )
+            .setPositiveButton("去授权") { _, _ -> openOverlaySettings() }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
     /** 跳「显示在其他应用上层」授权页。 */
     private fun openOverlaySettings() {
         val ok = runCatching {
@@ -1222,6 +1236,13 @@ class MainActivity : AppCompatActivity() {
         if (autoStartPending && !userStopped && !LocationRelayService.isRunning) {
             autoStartPending = false
             requestPermissionsThen { startRelay() }
+        }
+
+        // 悬浮球开着但权限被撤销时主动提醒
+        val ballOn = getSharedPreferences("lanenav", MODE_PRIVATE)
+            .getBoolean("float_ball", false)
+        if (ballOn && !FloatingBall.canShow(this) && !overlayPrompted) {
+            promptOverlayPermission()
         }
     }
 
