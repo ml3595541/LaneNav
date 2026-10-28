@@ -117,6 +117,19 @@ object PermCheck {
         }
     }
 
+    /**
+     * 悬浮窗权限（SYSTEM_ALERT_WINDOW）。
+     *
+     * 不在运行时权限弹窗里，只能跳「显示在其他应用上层」授权页。
+     * 只影响悬浮球显示，不影响转发本身，因此归为建议项。
+     */
+    fun overlay(ctx: Context): Boolean =
+        try {
+            Build.VERSION.SDK_INT < 23 || android.provider.Settings.canDrawOverlays(ctx)
+        } catch (e: Exception) {
+            false
+        }
+
     /** 电池优化是否已豁免。未豁免时息屏后可能被系统限流。 */
     fun batteryUnrestricted(ctx: Context): Boolean {
         return try {
@@ -168,6 +181,7 @@ object PermCheck {
         add(itemLocationSwitch(ctx))
         add(itemNoti(ctx))
         add(itemBattery(ctx))
+        add(itemOverlay(ctx))
     }
 
     /**
@@ -204,6 +218,7 @@ object PermCheck {
         add(itemLocationSwitch(ctx))
         add(itemNoti(ctx))
         add(itemBattery(ctx))
+        add(itemOverlay(ctx))
     }
 
     // ---------------- 单项目工厂（两端共用文案） ----------------
@@ -232,6 +247,16 @@ object PermCheck {
             "locsvc", "系统定位开关",
             if (ok) "已开启" else "已关闭 · 权限给了也拿不到坐标",
             ok
+        )
+    }
+
+    private fun itemOverlay(ctx: Context): Item {
+        val ok = overlay(ctx)
+        return Item(
+            "overlay", "悬浮窗",
+            if (ok) "已授予" else "未授予 · 悬浮球无法显示（不影响转发）",
+            ok,
+            critical = false
         )
     }
 

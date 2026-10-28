@@ -628,6 +628,8 @@ class MainActivity : AppCompatActivity() {
                 }.isSuccess
                 if (!ok) openAppSettings()
             }
+            // 悬浮窗（悬浮球用）
+            "overlay" -> openOverlaySettings()
             // 电池优化
             "battery" -> {
                 val direct = runCatching {

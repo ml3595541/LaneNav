@@ -10,6 +10,8 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- 悬浮球：后台显示盒子是否已连接 -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
 
     <!-- 蓝牙：Android 12+ (API31+) -->
     <uses-permission android:name="android.permission.BLUETOOTH_SCAN"

@@ -152,6 +152,48 @@ class LocationRelayService : Service() {
         startHeading()
         startLocationUpdates()
         startHeartbeat()
+
+        if (isBallEnabled() && FloatingBall.canShow(this)) {
+            FloatingBall.show(this)
+        }
+        startBallTicker()
+    }
+
+    private fun isBallEnabled(): Boolean =
+        getSharedPreferences("lanenav", MODE_PRIVATE)
+            .getBoolean("float_ball", false)
+
+    /**
+     * 悬浮球状态刷新。
+     *
+     * 判定「连接」用 clientCount / bleClientCount，而不是服务是否在跑：
+     * 服务活着但盒子没连上，必须显示红色的「未连接」，
+     * 否则用户看不出转发其实没送达。
+     */
+    private fun startBallTicker() {
+        thread(name = "ball-tick", isDaemon = true) {
+            while (isRunning) {
+                try {
+                    Thread.sleep(1000)
+                } catch (e: InterruptedException) {
+                    break
+                }
+                if (!isRunning) break
+
+                if (!isBallEnabled()) {
+                    if (FloatingBall.isShown()) FloatingBall.hide()
+                    continue
+                }
+                if (!FloatingBall.isShown() && FloatingBall.canShow(this)) {
+                    FloatingBall.show(this)
+                }
+                val connected = clientCount > 0 || bleClientCount > 0
+                FloatingBall.update(
+                    if (connected) "连接" else "未连接",
+                    if (connected) FloatingBall.COLOR_ON else FloatingBall.COLOR_OFF
+                )
+            }
+        }
     }
 
     /**
@@ -596,6 +638,7 @@ class LocationRelayService : Service() {
      */
     private fun cleanup() {
         isRunning = false
+        runCatching { FloatingBall.hide() }
         runCatching { lm.removeUpdates(listener) }
         runCatching { heading?.stop() }
         heading = null

@@ -815,6 +815,50 @@ class MainActivity : AppCompatActivity() {
         )
         root.addView(autoCard)
 
+        // ---------- 悬浮球 ----------
+        val ballCard = Ui.card(ctx)
+        ballCard.addView(Ui.sectionLabel(ctx, "悬浮球", Ui.MUTED))
+
+        val ballSp = getSharedPreferences("lanenav", MODE_PRIVATE)
+        val ballSwitch = Ui.checkbox(
+            ctx, "后台运行时显示连接状态",
+            ballSp.getBoolean("float_ball", false), accent
+        )
+        ballSwitch.setOnCheckedChangeListener { _, checked ->
+            if (checked && !FloatingBall.canShow(this)) {
+                // 未授权时不能开：立刻退回开关，并主动拉起授权页
+                ballSwitch.isChecked = false
+                Toast.makeText(
+                    this,
+                    "需要「显示在其他应用上层」权限，已为你打开设置",
+                    Toast.LENGTH_LONG
+                ).show()
+                openOverlaySettings()
+                return@setOnCheckedChangeListener
+            }
+            ballSp.edit().putBoolean("float_ball", checked).apply()
+            if (checked) FloatingBall.show(this) else FloatingBall.hide()
+        }
+        ballCard.addView(ballSwitch)
+        ballCard.addView(
+            Ui.body(
+                ctx,
+                "绿色「连接」= 盒子已连上，正在转发\n" +
+                    "红色「未连接」= 没有盒子连接（TCP / BLE 均无）\n" +
+                    "可拖动，位置自动记住"
+            )
+        )
+        val ballRow = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = Ui.dp(ctx, 10f) }
+        }
+        ballRow.addView(Ui.ghostButton(ctx, "悬浮窗权限", accent) { openOverlaySettings() })
+        ballCard.addView(ballRow)
+        root.addView(ballCard)
+
         // 必设清单
         val helpCard = Ui.card(ctx)
         helpCard.addView(Ui.sectionLabel(ctx, "手机必设，否则会出现断流", Ui.WARN))
@@ -1074,10 +1118,28 @@ class MainActivity : AppCompatActivity() {
                 }.isSuccess
                 if (!ok) openAppSettings()
             }
+            // 悬浮窗（悬浮球用）
+            "overlay" -> openOverlaySettings()
             // 电池优化
             "battery" -> openBatterySettings()
             // 兜底：应用详情页
             else -> openAppSettings()
+        }
+    }
+
+    /** 跳「显示在其他应用上层」授权页。 */
+    private fun openOverlaySettings() {
+        val ok = runCatching {
+            startActivity(
+                Intent(
+                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.parse("package:$packageName")
+                )
+            )
+        }.isSuccess
+        if (!ok) {
+            Toast.makeText(this, "无法打开悬浮窗设置，请手动前往系统设置", Toast.LENGTH_LONG).show()
+            openAppSettings()
         }
     }
 
