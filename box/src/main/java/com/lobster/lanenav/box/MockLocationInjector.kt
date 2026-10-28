@@ -1,10 +1,13 @@
 package com.lobster.lanenav.box
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.location.Criteria
 import android.location.Location
+import android.location.LocationListener
 import android.location.LocationManager
 import android.os.Build
+import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
 import com.lobster.lanenav.shared.LocationPacket
@@ -31,9 +34,29 @@ class MockLocationInjector(private val ctx: Context) {
     @Volatile var preparedAt: Long = 0L
         private set
 
+    // ---- 归还真实 GPS 后的「唤醒探针」 ----
+    // 移除测试提供器后，如果没有任何应用在请求 gps，系统 GNSS 引擎不会重新启动，
+    // 高德就一直拿不到定位、也不会自己切回原车 GPS。
+    // 这里由我们主动请求真实 gps，把引擎拉起来，位置会同时分发给所有监听者。
+    @Volatile private var realProbeActive = false
+    @Volatile var realFixAt: Long = 0L
+        private set
+
+    private val realListener = LocationListener { loc ->
+        if (loc.provider == PROVIDER) realFixAt = System.currentTimeMillis()
+    }
+
+    /** 距离最近一次真实 GPS 定位的毫秒数；-1 表示还没收到过 */
+    val realFixAgeMs: Long
+        get() = if (realFixAt > 0) System.currentTimeMillis() - realFixAt else -1L
+
+    val isProbingReal: Boolean get() = realProbeActive
+
     /** 注册测试提供器。失败(无 mock 权限)返回 false 并给出原因。 */
     fun prepare(): Pair<Boolean, String> {
         if (ready) return true to "已就绪"
+        // 重新接管前先停掉真实 GPS 探针，避免和自己抢同一个提供器
+        stopRealProbe()
         return try {
             // 已存在则先移除, 避免 IllegalArgumentException
             runCatching { lm.removeTestProvider(PROVIDER) }
@@ -124,13 +147,45 @@ class MockLocationInjector(private val ctx: Context) {
         }
     }
 
-    /** 停止注入: 关闭并移除提供器, 让系统 GPS 回到原生状态。 */
+    /**
+     * 停止注入，把定位交还车机自带 GPS。
+     *
+     * 两个关键点：
+     *  1. 不再先调 setTestProviderEnabled(false)。部分车机在「同名提供器」上执行
+     *     这个操作后，真实 gps 会被留在禁用态，移除测试提供器也不会自动恢复，
+     *     表现就是断开后高德一直不动、也不会切回原车 GPS。
+     *  2. 移除后主动请求一次真实 gps，把 GNSS 引擎唤醒，否则没有应用在请求定位，
+     *     引擎不启动，导航软件收不到任何回调。
+     */
     fun release() {
-        if (!ready) return
-        runCatching { lm.setTestProviderEnabled(PROVIDER, false) }
-        runCatching { lm.removeTestProvider(PROVIDER) }
-        ready = false
-        preparedAt = 0L
+        if (ready) {
+            runCatching { lm.removeTestProvider(PROVIDER) }
+            ready = false
+            preparedAt = 0L
+        }
+        startRealProbe()
+    }
+
+    /** 主动请求真实 GPS，唤醒系统 GNSS 引擎（位置会分发给所有监听者）。 */
+    @SuppressLint("MissingPermission")
+    fun startRealProbe() {
+        if (realProbeActive) return
+        realProbeActive = true
+        realFixAt = 0L
+        runCatching {
+            lm.requestLocationUpdates(
+                PROVIDER, 1000L, 0f, realListener, Looper.getMainLooper()
+            )
+        }.onFailure {
+            Log.w(TAG, "真实 GPS 探针启动失败: ${it.message}")
+            realProbeActive = false
+        }
+    }
+
+    fun stopRealProbe() {
+        if (!realProbeActive) return
+        realProbeActive = false
+        runCatching { lm.removeUpdates(realListener) }
     }
 
     private fun normalizeBearing(b: Float): Float {

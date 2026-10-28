@@ -383,6 +383,44 @@ class MainActivity : AppCompatActivity() {
                 Ui.DIM
             )
         )
+        // ---------- 悬浮球 ----------
+        val ballCard = Ui.card(ctx)
+        ballCard.addView(Ui.sectionLabel(ctx, "悬浮球", Ui.MUTED))
+        val ballSwitch = Ui.checkbox(ctx, "后台运行时显示连接状态", cfg.floatBall, accent)
+        ballSwitch.setOnCheckedChangeListener { _, checked ->
+            if (checked && !FloatingBall.canShow(this)) {
+                // 没有悬浮窗权限时不能开，直接把开关退回去并引导授权
+                ballSwitch.isChecked = false
+                android.widget.Toast.makeText(
+                    this, "请先授予「显示在其他应用上层」权限",
+                    android.widget.Toast.LENGTH_LONG
+                ).show()
+                openOverlaySettings()
+                return@setOnCheckedChangeListener
+            }
+            cfg.floatBall = checked
+            if (checked) FloatingBall.show(this) else FloatingBall.hide()
+        }
+        ballCard.addView(ballSwitch)
+        ballCard.addView(
+            Ui.body(
+                ctx,
+                "绿色「手机」= 正在使用手机 GPS\n" +
+                    "黄色「车机」= 已断开，回落到车机自带 GPS\n" +
+                    "可拖动，位置自动记住"
+            )
+        )
+        val ballRow = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = Ui.dp(ctx, 10f) }
+        }
+        ballRow.addView(Ui.ghostButton(ctx, "悬浮窗权限", accent) { openOverlaySettings() })
+        ballCard.addView(ballRow)
+        root.addView(ballCard)
+
         root.addView(helpCard)
 
         // ---------- 作者联系方式 ----------
@@ -422,6 +460,23 @@ class MainActivity : AppCompatActivity() {
         })
 
         requestLocationPermission()
+    }
+
+    /** 跳系统「显示在其他应用上层」授权页。 */
+    private fun openOverlaySettings() {
+        runCatching {
+            startActivity(
+                Intent(
+                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.parse("package:$packageName")
+                )
+            )
+        }.onFailure {
+            android.widget.Toast.makeText(
+                this, "无法打开悬浮窗设置，请手动前往系统设置",
+                android.widget.Toast.LENGTH_LONG
+            ).show()
+        }
     }
 
     private fun updateIpVisibility() {

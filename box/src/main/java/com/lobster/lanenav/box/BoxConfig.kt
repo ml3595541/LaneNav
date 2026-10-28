@@ -29,6 +29,11 @@ class BoxConfig(ctx: Context) {
         get() = sp.getString(KEY_CHANNEL, "both") ?: "both"
         set(v) = sp.edit().putString(KEY_CHANNEL, v).apply()
 
+    /** 后台悬浮球：显示当前用的是手机还是车机 GPS */
+    var floatBall: Boolean
+        get() = sp.getBoolean(KEY_BALL, true)
+        set(v) = sp.edit().putBoolean(KEY_BALL, v).apply()
+
     /** 熄火省电: 静止超过 N 秒通知手机降频 */
     var ecoMode: Boolean
         get() = sp.getBoolean(KEY_ECO, true)
@@ -41,5 +46,6 @@ class BoxConfig(ctx: Context) {
         const val KEY_BOOT = "boot_start"
         const val KEY_ECO = "eco_mode"
         const val KEY_CHANNEL = "channel"
+        const val KEY_BALL = "float_ball"
     }
 }

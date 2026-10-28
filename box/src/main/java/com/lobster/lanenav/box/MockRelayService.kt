@@ -100,6 +100,12 @@ class MockRelayService : Service() {
                 System.currentTimeMillis() - lastPacketAt < 5000
         }
         sourceMonitor.start()
+
+        // 悬浮球：后台也能一眼看出在用谁的 GPS
+        if (cfg.floatBall && FloatingBall.canShow(this)) {
+            FloatingBall.show(this)
+        }
+
         running = true
 
         // ── 前台服务启动保护 ──
@@ -347,6 +353,22 @@ class MockRelayService : Service() {
             sleepQuiet(1000)
             if (!running) break
             val now = System.currentTimeMillis()
+
+            // 悬浮球状态：只反映「此刻到底在用谁的 GPS」
+            if (cfg.floatBall) {
+                if (!FloatingBall.isShown() && FloatingBall.canShow(this)) {
+                    FloatingBall.show(this)
+                }
+                val usingPhone = injector.isReady && lastPacketAt > 0 &&
+                    now - lastPacketAt < 5000
+                FloatingBall.update(
+                    if (usingPhone) "手机" else "车机",
+                    if (usingPhone) FloatingBall.COLOR_PHONE else FloatingBall.COLOR_BOX
+                )
+            } else if (FloatingBall.isShown()) {
+                FloatingBall.hide()
+            }
+
             val ref = if (lastPacketAt > 0) lastPacketAt else serviceStartedAt
             val silentMs = now - ref
 
@@ -553,6 +575,7 @@ class MockRelayService : Service() {
     override fun onDestroy() {
         running = false
         runCatching { socket?.close() }
+        runCatching { FloatingBall.hide() }
         runCatching { bleClient?.close() }
         runCatching { sourceMonitor.stop() }
         runCatching { injector.release() }
